@@ -1,0 +1,5 @@
+name: 'Env Probe Action'
+description: 'Probes privileged action environment variables'
+runs:
+  using: 'node20'
+  main: 'index.js'
