@@ -15,4 +15,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Run probe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: node probe-action/index.js
