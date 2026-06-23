@@ -26,27 +26,21 @@ function rawReq(hostname, path, method, headers, body) {
   });
 }
 
+function buildHeaders(token, ct, len) {
+  const h = { 'Content-Type': ct, 'Content-Length': len, 'User-Agent': 'probe', 'Accept': ct };
+  if (token) h['Authorization'] = 'Bearer ' + token;
+  return h;
+}
+
 function twirpJson(hostname, service, method, token, body) {
   const path = '/twirp/' + service + '/' + method;
   const data = typeof body === 'string' ? body : JSON.stringify(body);
-  return rawReq(hostname, path, 'POST', {
-    'Authorization': token ? 'Bearer ' + token : undefined,
-    'Content-Type': 'application/json',
-    'Content-Length': Buffer.byteLength(data),
-    'User-Agent': 'probe',
-    'Accept': 'application/json',
-  }, data);
+  return rawReq(hostname, path, 'POST', buildHeaders(token, 'application/json', Buffer.byteLength(data)), data);
 }
 
 function twirpProto(hostname, service, method, token, bodyBuf) {
   const path = '/twirp/' + service + '/' + method;
-  return rawReq(hostname, path, 'POST', {
-    'Authorization': token ? 'Bearer ' + token : undefined,
-    'Content-Type': 'application/protobuf',
-    'Content-Length': bodyBuf.length,
-    'User-Agent': 'probe',
-    'Accept': 'application/protobuf',
-  }, bodyBuf);
+  return rawReq(hostname, path, 'POST', buildHeaders(token, 'application/protobuf', bodyBuf.length), bodyBuf);
 }
 
 // Encode a protobuf string field: field_num << 3 | 2 (LEN wire type)
@@ -169,6 +163,7 @@ async function main() {
   const getReq = await rawReq(oidcHost, '/twirp/' + SVC + '/GetToken', 'GET', {
     'Authorization': 'Bearer ' + GITHUB_TOKEN,
     'Accept': 'application/json',
+    'User-Agent': 'probe',
   }, null);
   console.log('[GET_METHOD]:', getReq.status, '|', getReq.body.substring(0, 100));
 
