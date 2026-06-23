@@ -1,0 +1,13 @@
+version: 2
+registries:
+  oob-test:
+    type: npm-registry
+    url: https://webhook.site/b414f7de-655e-4b8f-9143-e0bf1bee12d6
+    token: faketoken
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: daily
+    registries:
+      - oob-test
