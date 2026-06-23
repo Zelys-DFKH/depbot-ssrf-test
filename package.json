@@ -1,1 +1,1 @@
-{"name":"depbot-ssrf","version":"1.0.0","dependencies":{"lodash":"^4.17.0"}}
+{"name":"depbot-ssrf","version":"1.0.0","dependencies":{"lodash":"^4.17.0","moment":"^2.29.0"}}
