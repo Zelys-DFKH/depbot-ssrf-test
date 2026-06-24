@@ -1,0 +1,65 @@
+name: probe_v75_meterstop
+on:
+  workflow_dispatch:
+jobs:
+  meterstop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: meter-stop-liveness
+        continue-on-error: true
+        run: |
+          python3 - <<'PYEOF'
+          import json, base64, urllib.request, urllib.error, time
+
+          s=json.load(open('/opt/hca/.settings'))
+          tok=s['authToken']; sched=s['schedulerApiUrl']
+          def b64ud(x):
+              x+='='*(-len(x)%4); return base64.urlsafe_b64decode(x)
+          claims=json.loads(b64ud(tok.split('.')[1]))
+          wid=claims.get('wid')
+          t0=time.time()
+          print('SCHED=%s' % sched)
+          print('CLAIMS iat=%s ret=%s rbf=%s reg=%s' % (claims.get('iat'),claims.get('ret'),claims.get('rbf'),claims.get('reg')))
+          print('NOW=%d  rbf_minus_now=%ss (token validity headroom)' % (t0, (claims.get('rbf',0)-t0)))
+
+          def call(method, path, body=None):
+              data=json.dumps(body).encode() if body is not None else None
+              r=urllib.request.Request(sched+path, data=data, method=method)
+              r.add_header('Authorization','Bearer '+tok); r.add_header('Content-Type','application/json')
+              try:
+                  resp=urllib.request.urlopen(r,timeout=12); return resp.status, resp.read(150).decode('utf-8','replace')
+              except urllib.error.HTTPError as e:
+                  return e.code, e.read(170).decode('utf-8','replace')
+              except Exception as e:
+                  return 'ERR', str(e)[:70]
+
+          def el(): return time.time()-t0
+
+          # ---- baseline (pre-DELETE) ----
+          gst,gb=call('GET','/request'); print('T+%05.1f GET /request   BASELINE -> %s | %s' % (el(),gst,gb[:80].replace(chr(10),' ')))
+          hst,hb=call('PUT','/request/heartbeat',{'allocationId':wid}); print('T+%05.1f PUT heartbeat  BASELINE -> %s' % (el(),hst))
+
+          # ---- fire DELETE at ~T+15 ----
+          time.sleep(15)
+          dst,db=call('DELETE','/request'); print('T+%05.1f *** DELETE /request -> %s | %s' % (el(),dst,db[:90].replace(chr(10),' ')))
+
+          # ---- post-DELETE liveness loop: 16 x 10s = 160s ----
+          base_get=gst; flipped=False
+          for i in range(16):
+              time.sleep(10)
+              gst,gb=call('GET','/request')
+              hst,hb=call('PUT','/request/heartbeat',{'allocationId':wid})
+              note=''
+              if gst!=base_get:
+                  note=' <<< GET-STATUS-FLIP (lease state changed post-DELETE)'; flipped=True
+              if isinstance(hst,int) and hst==401:
+                  note+=' <<< HEARTBEAT-NOW-401 (worker identity released)'
+              print('T+%05.1f ALIVE i=%02d | GET=%s "%s" | HB=%s%s' % (el(),i,gst,gb[:40].replace(chr(10),' '),hst,note))
+
+          survived=el()-15
+          print('T+%05.1f LOOP_COMPLETE | vm_alive_post_delete=%.0fs | get_status_flipped=%s' % (el(),survived,flipped))
+          print('VERDICT_HINT: flip+alive => lease released while compute continued (meter-stop candidate). '
+                'no-flip+200-heartbeat => DELETE was a no-op (refute). loop-died-early => VM torn down (refute).')
+          print('=== DONE ===')
+          PYEOF
