@@ -1,0 +1,56 @@
+name: probe_v79_consumer
+on:
+  workflow_dispatch:
+    inputs:
+      run_bid:
+        description: producer workflow_run_backend_id
+        required: true
+      job_bid:
+        description: producer workflow_job_run_backend_id
+        required: true
+jobs:
+  consume:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: cross-run-artifact-read
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const M = (s) => core.info('MARK ' + s);
+            const rt = process.env.ACTIONS_RUNTIME_TOKEN || '';
+            const ru = (process.env.ACTIONS_RESULTS_URL || '').replace(/\/$/, '');
+            M('RT_PRESENT=' + (rt ? 'yes' : 'NO'));
+            if (!rt) { M('CONSUMER_ABORT no ACTIONS_RUNTIME_TOKEN in JS-action context'); return; }
+            const dec = (t) => { try { return JSON.parse(Buffer.from(t.split('.')[1].replace(/-/g,'+').replace(/_/g,'/'),'base64').toString()); } catch(e){ return {}; } };
+            const myscp = dec(rt).scp || '';
+            const mm = myscp.match(/Actions\.Results:([0-9a-fA-F-]+):([0-9a-fA-F-]+)/);
+            const myrun = mm ? mm[1] : '', myjob = mm ? mm[2] : '';
+            const Prun = String('${{ github.event.inputs.run_bid }}').trim();
+            const Pjob = String('${{ github.event.inputs.job_bid }}').trim();
+            M('MY_RUN_BID=' + myrun + ' MY_JOB_BID=' + myjob);
+            M('PROD_RUN_BID=' + Prun + ' PROD_JOB_BID=' + Pjob);
+            const tw = async (meth, body) => {
+              const r = await fetch(ru + '/twirp/github.actions.results.api.v1.ArtifactService/' + meth,
+                { method:'POST', headers:{'Authorization':'Bearer '+rt,'Content-Type':'application/json'}, body: JSON.stringify(body) });
+              return [r.status, await r.text()];
+            };
+            // POSITIVE CONTROL: list our OWN run's artifacts (proves harness + proto + token are good)
+            let [c1, b1] = await tw('ListArtifacts', {workflow_run_backend_id:myrun, workflow_job_run_backend_id:myjob});
+            M('CONTROL_OWN_LIST -> ' + c1 + ' | ' + b1.slice(0,200).replace(/\n/g,' '));
+            // TEST: list PRODUCER's artifacts with OUR token (scp covers a DIFFERENT run)
+            let [c2, b2] = await tw('ListArtifacts', {workflow_run_backend_id:Prun, workflow_job_run_backend_id:Pjob});
+            const cross = (c2>=200 && c2<300 && /artifact/i.test(b2) && !b2.replace(/\s/g,'').includes('"artifacts":[]'));
+            M('TEST_CROSS_LIST -> ' + c2 + (cross ? ' <<< CROSS-RUN READ (scp NOT enforced)' : '') + ' | ' + b2.slice(0,260).replace(/\n/g,' '));
+            if (cross) {
+              try {
+                for (const a of (JSON.parse(b2).artifacts || []).slice(0,2)) {
+                  let [ds, db] = await tw('GetSignedArtifactURL', {workflow_run_backend_id:Prun, workflow_job_run_backend_id:Pjob, name:a.name});
+                  M('SIGNEDURL[' + a.name + '] -> ' + ds + ' | ' + db.slice(0,160).replace(/\n/g,' '));
+                  const um = db.match(/https?:\/\/[^"\\ ]+/);
+                  if (um) { try { const d = await (await fetch(um[0])).text(); M('CANARY_FETCH=' + d.slice(0,160).replace(/\n/g,' ')); } catch(e){ M('CANARY_FETCH_ERR='+String(e).slice(0,100)); } }
+                }
+              } catch (e) { M('PARSE_ERR=' + String(e).slice(0,120)); }
+            }
+            M('CONSUMER_DONE');
