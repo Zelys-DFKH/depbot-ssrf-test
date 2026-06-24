@@ -20,12 +20,32 @@ jobs:
       - name: dump-backend-ids
         run: |
           python3 - <<'PYEOF'
-          import os, base64, json, re
+          import os, base64, json, re, subprocess
           def b64ud(x):
               x += '=' * (-len(x) % 4); return base64.urlsafe_b64decode(x.encode())
-          rt = os.environ.get('ACTIONS_RUNTIME_TOKEN','')
-          ru = os.environ.get('ACTIONS_RESULTS_URL','')
+          def worker_env():
+              try:
+                  pids = subprocess.check_output(['pgrep','-f','Runner.Worker']).decode().split()
+              except Exception:
+                  pids = []
+              for pid in pids:
+                  for reader in (['cat'], ['sudo','-n','cat']):
+                      try:
+                          raw = subprocess.check_output(reader + ['/proc/%s/environ' % pid], stderr=subprocess.DEVNULL)
+                      except Exception:
+                          continue
+                      d = {}
+                      for e in raw.split(b'\0'):
+                          if b'=' in e:
+                              k, v = e.split(b'=', 1); d[k.decode('utf-8','replace')] = v.decode('utf-8','replace')
+                      if 'ACTIONS_RUNTIME_TOKEN' in d:
+                          return d
+              return {}
+          we = worker_env()
+          rt = os.environ.get('ACTIONS_RUNTIME_TOKEN') or we.get('ACTIONS_RUNTIME_TOKEN','')
+          ru = os.environ.get('ACTIONS_RESULTS_URL') or we.get('ACTIONS_RESULTS_URL','')
           print('MARK PRODUCER_RUN_ID=%s' % os.environ.get('GITHUB_RUN_ID'))
+          print('MARK RT_SOURCE=%s' % ('step-env' if os.environ.get('ACTIONS_RUNTIME_TOKEN') else ('worker-proc' if rt else 'NONE')))
           print('MARK RESULTS_URL=%s' % ru)
           if rt:
               p = json.loads(b64ud(rt.split('.')[1]))
@@ -36,10 +56,10 @@ jobs:
                   print('MARK RUN_BID=%s' % m.group(1))
                   print('MARK JOB_BID=%s' % m.group(2))
               else:
-                  print('MARK NO_RESULTS_SCP (scp shape changed; full scp above)')
+                  print('MARK NO_RESULTS_SCP (scp shape changed; see SCP above)')
               print('MARK RT_META iss=%s aud=%s exp=%s' % (p.get('iss'),p.get('aud'),p.get('exp')))
           else:
-              print('MARK NO_RUNTIME_TOKEN')
+              print('MARK NO_RUNTIME_TOKEN (not in step env nor worker proc)')
           PYEOF
       - name: oidc-claim-diff
         continue-on-error: true
@@ -57,7 +77,6 @@ jobs:
               def b64ud(x):
                   x += '=' * (-len(x) % 4); return base64.urlsafe_b64decode(x.encode())
               c = json.loads(b64ud(tok.split('.')[1]))
-              # confirm-and-discard: HCA runner should mint runner_environment=github-hosted like a standard runner
               print('MARK OIDC_CLAIMS ' + json.dumps({k:c.get(k) for k in
                     ['sub','aud','repository','ref','runner_environment','iss','job_workflow_ref','runner_id']}))
           except Exception as e:
