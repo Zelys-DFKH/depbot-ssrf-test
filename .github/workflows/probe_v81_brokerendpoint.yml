@@ -1,0 +1,22 @@
+name: probe_v81_brokerendpoint
+on:
+  workflow_dispatch:
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: capture-broker-endpoints
+        run: |
+          set +e
+          # Find runner _diag logs (Listener + Worker) wherever they live
+          LOGS=$(sudo find / -path '*_diag*' \( -name 'Runner_*.log' -o -name 'Worker_*.log' \) 2>/dev/null)
+          echo "MARK DIAG_COUNT=$(echo "$LOGS" | grep -c . )"
+          # Exact broker URLs the live runner hit (paths + query params reveal the acquire/message endpoint)
+          echo "$LOGS" | xargs -r sudo grep -hoaE 'https://broker\.actions\.githubusercontent\.com[^ "'"'"'\\]*' 2>/dev/null | sort -u | head -25 | sed 's/^/MARK BROKER_URL=/'
+          # Also any run-service / pipelines / results URLs for context
+          echo "$LOGS" | xargs -r sudo grep -hoaE 'https://[a-z0-9.-]*actions\.githubusercontent\.com/[^ "'"'"'\\]*' 2>/dev/null | grep -aiE 'message|session|acquire|job|request' | sort -u | head -25 | sed 's/^/MARK RUNNER_REQ=/'
+          # HTTP verbs + paths around broker calls (1 line of context)
+          echo "$LOGS" | xargs -r sudo grep -haiE 'broker|acquirejob|getmessage|GET /message|POST /session' 2>/dev/null | grep -aoiE '(GET|POST|DELETE|PUT) /[A-Za-z0-9/_?=&.-]+' | sort -u | head -25 | sed 's/^/MARK VERB_PATH=/'
+          echo "MARK CAPTURE_DONE"
