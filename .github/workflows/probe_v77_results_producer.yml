@@ -1,0 +1,65 @@
+name: probe_v77_results_producer
+on:
+  workflow_dispatch:
+jobs:
+  produce:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: make-canary
+        run: |
+          echo "V77-CANARY-RUN-${GITHUB_RUN_ID}-secretmarker-$(date +%s)" > canary.txt
+          cat canary.txt
+      - name: upload-canary
+        uses: actions/upload-artifact@v4
+        with:
+          name: v77canary
+          path: canary.txt
+      - name: dump-backend-ids
+        run: |
+          python3 - <<'PYEOF'
+          import os, base64, json, re
+          def b64ud(x):
+              x += '=' * (-len(x) % 4); return base64.urlsafe_b64decode(x.encode())
+          rt = os.environ.get('ACTIONS_RUNTIME_TOKEN','')
+          ru = os.environ.get('ACTIONS_RESULTS_URL','')
+          print('MARK PRODUCER_RUN_ID=%s' % os.environ.get('GITHUB_RUN_ID'))
+          print('MARK RESULTS_URL=%s' % ru)
+          if rt:
+              p = json.loads(b64ud(rt.split('.')[1]))
+              scp = p.get('scp','')
+              print('MARK SCP=%s' % scp)
+              m = re.search(r'Actions\.Results:([0-9a-fA-F-]+):([0-9a-fA-F-]+)', scp)
+              if m:
+                  print('MARK RUN_BID=%s' % m.group(1))
+                  print('MARK JOB_BID=%s' % m.group(2))
+              else:
+                  print('MARK NO_RESULTS_SCP (scp shape changed; full scp above)')
+              print('MARK RT_META iss=%s aud=%s exp=%s' % (p.get('iss'),p.get('aud'),p.get('exp')))
+          else:
+              print('MARK NO_RUNTIME_TOKEN')
+          PYEOF
+      - name: oidc-claim-diff
+        continue-on-error: true
+        run: |
+          python3 - <<'PYEOF'
+          import os, base64, json, urllib.request
+          ru = os.environ.get('ACTIONS_ID_TOKEN_REQUEST_URL','')
+          rtt = os.environ.get('ACTIONS_ID_TOKEN_REQUEST_TOKEN','')
+          if not ru:
+              print('MARK OIDC=unavailable'); raise SystemExit
+          req = urllib.request.Request(ru + '&audience=sts.amazonaws.com')
+          req.add_header('Authorization','bearer ' + rtt)
+          try:
+              tok = json.loads(urllib.request.urlopen(req, timeout=15).read())['value']
+              def b64ud(x):
+                  x += '=' * (-len(x) % 4); return base64.urlsafe_b64decode(x.encode())
+              c = json.loads(b64ud(tok.split('.')[1]))
+              # confirm-and-discard: HCA runner should mint runner_environment=github-hosted like a standard runner
+              print('MARK OIDC_CLAIMS ' + json.dumps({k:c.get(k) for k in
+                    ['sub','aud','repository','ref','runner_environment','iss','job_workflow_ref','runner_id']}))
+          except Exception as e:
+              print('MARK OIDC_ERR=' + str(e)[:120])
+          PYEOF
