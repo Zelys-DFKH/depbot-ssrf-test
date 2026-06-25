@@ -1,0 +1,44 @@
+name: probe_v82_cache_producer
+on:
+  workflow_dispatch:
+jobs:
+  produce:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: create-cache-entry
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const M = (s) => core.info('MARK ' + s);
+            const crypto = require('crypto');
+            const rt = process.env.ACTIONS_RUNTIME_TOKEN || '';
+            const ru = (process.env.ACTIONS_RESULTS_URL || '').replace(/\/$/, '');
+            M('RT_PRESENT=' + (rt ? 'yes' : 'NO'));
+            M('RESULTS_URL=' + ru);
+            M('REF=' + process.env.GITHUB_REF + ' SHA=' + (process.env.GITHUB_SHA||'').slice(0,8));
+            if (!rt || !ru) { M('PRODUCER_ABORT no token/url'); return; }
+            const SVC = 'github.actions.results.api.v1.CacheService';
+            const tw = async (meth, body) => {
+              const r = await fetch(ru + '/twirp/' + SVC + '/' + meth,
+                { method:'POST', headers:{'Authorization':'Bearer '+rt,'Content-Type':'application/json'}, body: JSON.stringify(body) });
+              return [r.status, await r.text()];
+            };
+            const key = 'v82cache-' + process.env.GITHUB_RUN_ID;
+            const version = crypto.createHash('sha256').update(key + '|v82').digest('hex');
+            M('CACHE_KEY=' + key);
+            M('CACHE_VERSION=' + version);
+            let [cs, cb] = await tw('CreateCacheEntry', {key, version});
+            M('CREATE -> ' + cs + ' | ' + cb.slice(0,220).replace(/\n/g,' '));
+            let up = null;
+            try { const j = JSON.parse(cb); up = j.signed_upload_url || j.signedUploadUrl || j.uploadUrl; } catch(e){}
+            if (!up) { M('NO_UPLOAD_URL (CreateCacheEntry returned no url; field/shape?) -> cannot finalize'); M('PRODUCER_DONE'); return; }
+            const blob = Buffer.from('V82-CACHE-CANARY-RUN-' + process.env.GITHUB_RUN_ID + '-secretmarker');
+            try {
+              const pr = await fetch(up, { method:'PUT', headers:{'x-ms-blob-type':'BlockBlob','Content-Length':String(blob.length)}, body: blob });
+              M('UPLOAD -> ' + pr.status);
+            } catch(e){ M('UPLOAD_ERR=' + String(e).slice(0,120)); }
+            let [fs_, fb] = await tw('FinalizeCacheEntry', {key, version, size_bytes: blob.length});
+            M('FINALIZE -> ' + fs_ + ' | ' + fb.slice(0,180).replace(/\n/g,' '));
+            M('PRODUCER_DONE');
