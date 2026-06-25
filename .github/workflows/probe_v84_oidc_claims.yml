@@ -1,0 +1,55 @@
+name: probe_v84_oidc_claims
+on:
+  workflow_dispatch:
+    inputs:
+      audience:
+        description: requested OIDC audience
+        required: false
+        default: 'https://example.com/test-aud'
+jobs:
+  oidc:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: mint-and-decode-oidc
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const M = (s) => core.info('MARK ' + s);
+            const reqUrl = process.env.ACTIONS_ID_TOKEN_REQUEST_URL || '';
+            const reqTok = process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN || '';
+            M('OIDC_REQ_URL_PRESENT=' + (reqUrl ? 'yes' : 'NO'));
+            M('OIDC_REQ_TOK_PRESENT=' + (reqTok ? 'yes' : 'NO'));
+            if (!reqUrl || !reqTok) { M('OIDC_ABORT no request url/token'); return; }
+            const dec = (jwt) => { try { const p = jwt.split('.')[1].replace(/-/g,'+').replace(/_/g,'/'); return JSON.parse(Buffer.from(p,'base64').toString('utf8')); } catch(e){ return {__err:String(e)}; } };
+            const getTok = async (aud) => {
+              const u = reqUrl + (aud ? ('&audience=' + encodeURIComponent(aud)) : '');
+              const r = await fetch(u, { headers: { 'Authorization': 'Bearer ' + reqTok, 'Accept':'application/json' } });
+              const t = await r.text();
+              let val = null; try { val = JSON.parse(t).value; } catch(e){}
+              return [r.status, val, t.slice(0,160)];
+            };
+            // 1) default-audience token: enumerate the full claim set
+            let [s1, jwt1] = await getTok(null);
+            M('TOK_DEFAULT_AUD -> http ' + s1 + (jwt1 ? ' (jwt len ' + jwt1.length + ')' : ' NO-JWT'));
+            if (jwt1) {
+              const c = dec(jwt1);
+              const hdr = (()=>{ try { return JSON.parse(Buffer.from(jwt1.split('.')[0].replace(/-/g,'+').replace(/_/g,'/'),'base64').toString('utf8')); } catch(e){ return {}; } })();
+              M('OIDC_HEADER alg=' + hdr.alg + ' kid=' + (hdr.kid||'').slice(0,16));
+              M('OIDC_CLAIM_KEYS=' + Object.keys(c).sort().join(','));
+              for (const k of ['iss','aud','sub','repository','repository_owner','repository_id','repository_owner_id','actor','actor_id','workflow_ref','job_workflow_ref','ref','sha','runner_environment','environment','run_id','exp','iat','nbf']) {
+                if (k in c) M('CLAIM[' + k + ']=' + String(c[k]).slice(0,120));
+              }
+            }
+            // 2) caller-chosen audience honored verbatim? (by design, but confirm + look for any reflection)
+            const customAud = String('${{ github.event.inputs.audience }}');
+            let [s2, jwt2] = await getTok(customAud);
+            if (jwt2) { const c2 = dec(jwt2); M('CUSTOM_AUD_ECHO requested=' + customAud + ' got_aud=' + String(c2.aud)); }
+            else { M('CUSTOM_AUD -> http ' + s2); }
+            // 3) probe: can sub/identity claims be influenced by a crafted audience injection? (aud should NOT alter sub)
+            let [s3, jwt3] = await getTok('foo&sub=repo:other/victim:ref:refs/heads/main');
+            if (jwt3) { const c3 = dec(jwt3); M('SUB_INJECT_ATTEMPT got_sub=' + String(c3.sub) + ' got_aud=' + String(c3.aud) + ' (sub unchanged = safe)'); }
+            else { M('SUB_INJECT_ATTEMPT -> http ' + s3); }
+            M('OIDC_DONE');
