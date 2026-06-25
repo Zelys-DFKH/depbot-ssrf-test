@@ -42,7 +42,7 @@ jobs:
             if (up) {
               const blob = Buffer.from('ctrl');
               try { await fetch(up, {method:'PUT', headers:{'x-ms-blob-type':'BlockBlob','Content-Length':'4'}, body:blob}); } catch(e){}
-              await tw('FinalizeCacheEntry', {key:ckey, version:cver, size_bytes:4});
+              await tw('FinalizeCacheEntryUpload', {key:ckey, version:cver, size_bytes:4});
             }
             let [cc, cbody] = await tw('GetCacheEntryDownloadURL', {key:ckey, restore_keys:[], version:cver});
             const ctrlOk = (cc>=200 && cc<300 && /signed|download|url|true/i.test(cbody));
