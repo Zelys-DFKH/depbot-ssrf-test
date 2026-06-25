@@ -39,6 +39,6 @@ jobs:
               const pr = await fetch(up, { method:'PUT', headers:{'x-ms-blob-type':'BlockBlob','Content-Length':String(blob.length)}, body: blob });
               M('UPLOAD -> ' + pr.status);
             } catch(e){ M('UPLOAD_ERR=' + String(e).slice(0,120)); }
-            let [fs_, fb] = await tw('FinalizeCacheEntry', {key, version, size_bytes: blob.length});
+            let [fs_, fb] = await tw('FinalizeCacheEntryUpload', {key, version, size_bytes: blob.length});
             M('FINALIZE -> ' + fs_ + ' | ' + fb.slice(0,180).replace(/\n/g,' '));
             M('PRODUCER_DONE');
